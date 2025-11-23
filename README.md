@@ -30,6 +30,7 @@ Env overrides the -l set
 
 make sure -l is appended so env is supported
 
+# one device is supported only if you wanted multiples just hit me up and ill add multi device support
 
 PLEASE DO GO https://github.com/thewierdnut/asha_pipewire_sink.git documentations BEFORE USE
 
