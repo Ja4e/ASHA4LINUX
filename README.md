@@ -32,6 +32,9 @@ make sure -l is appended so env is supported
 
 # one device is supported only if you wanted multiples just hit me up and ill add multi device support
 
+WHen the device is unable to connect for extended period of time, for my unit Audiostream from MEDEL just use the applications to "attempt" to update the firmware and after the sucessive connections intercept it before the gui in the screen pops up confirming its done. It was really reliable doing it.
+The reason unable to connect for exteneded period of time is unknown. No existing documentations are there online or anywhere. Bluez has the worst documentation I ever had. 
+
 PLEASE DO GO https://github.com/thewierdnut/asha_pipewire_sink.git documentations BEFORE USE
 
 ### Required by SIG documentations:
