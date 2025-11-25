@@ -58,8 +58,13 @@ I find setting from ConnectionSupervisionTimeout=100 to 2000 to be better in con
 
 My personal config:
 ```
+TemporaryTimeout = 11
+# AudioStreamer creates new mac right after failed conn
+
 DiscoverableTimeout = 0
-ControllerMode = le #This might not even be necessary just igore this if you actually wanted to use this
+ControllerMode = le
+#This might not even be necessary just igore this if you actually wanted to use this
+
 FastConnectable = true
 
 KernelExperimental = true
