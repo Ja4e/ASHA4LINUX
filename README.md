@@ -105,6 +105,11 @@ please do configure them:
 # ~/.config/asha_manager/config.json
 
 
+hmmm medel's DFU has a weird uuid
+b2152466-d607-11e8-9f8b-f2801f1b9fd1
+https://www.onsemi.com/download/reference-manuals/pdf/device%20firmware%20update%20(dfu)%20guide.pdf
+indicates it likely uses RSL10 
+
 
 
 README file need to be revamped for better readability
