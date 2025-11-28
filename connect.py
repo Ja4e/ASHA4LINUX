@@ -257,10 +257,10 @@ PRIMARY_DEVICES = [device for device in PRIMARY_DEVICES if device]
 SECONDARY_DEVICES = [device for device in SECONDARY_DEVICES if device]
 ALL_DEVICE_FILTERS = [device for device in ALL_DEVICE_FILTERS if device]
 
-logger.info(f"Primary devices: {PRIMARY_DEVICES}")
-if SECONDARY_DEVICES:
-	logger.info(f"Secondary devices: {SECONDARY_DEVICES}")
-logger.info(f"Max simultaneous devices: {MAX_DEVICES}")
+# logger.info(f"Primary devices: {PRIMARY_DEVICES}")
+# if SECONDARY_DEVICES:
+# 	logger.info(f"Secondary devices: {SECONDARY_DEVICES}")
+# logger.info(f"Max simultaneous devices: {MAX_DEVICES}")
 if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
 	logger.info(f"Secondary reconnection: {SECONDARY_RECONNECTION_MODE} mode (initial: {SECONDARY_INITIAL_DELAY}s, max: {SECONDARY_MAX_DELAY}s)")
 
