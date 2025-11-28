@@ -17,8 +17,8 @@ DESC2 = "BT_Sink"
 DESC3 = "Combined_Sink"
 
 # Do use "pactl list short sources" in your pipewire machine to find out the name should be different across the devices
-TARGET1 = os.environ.get('ASHA_SINK', 'asha_16450405641617933895') #Please change this to your asha 
-TARGET2 = os.environ.get('BT_SINK', 'bluez_output.#x#x#X#') #Please change this as well 
+TARGET1 = os.environ.get('ASHA_SINK', 'asha_16450405641617933895') # Please change this to your asha 
+TARGET2 = os.environ.get('BT_SINK', 'bluez_output.#x#x#X#') # Please change this as well 
 
 '''
 WARNING!
@@ -43,14 +43,12 @@ VOL1_ORIG = VOL2_ORIG = None
 ID1 = ID2 = LB1 = LB2 = ID_COMB = None
 stop_flag = threading.Event()
 
-
 # === HELPERS ===
 def run_cmd(cmd, capture=False, check=True):
     if capture:
         return subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode().strip()
     else:
         subprocess.check_call(cmd)
-
 
 def get_map(channel):
     if channel == 'left': return 'channel_map=front-left,front-left'
@@ -60,35 +58,103 @@ def get_map(channel):
     sys.exit(1)
 
 
-def wait_sink(name, retries=25, delay=0.2):
-    for _ in range(retries):
-        out = run_cmd(['pactl', 'list', 'short', 'sinks'], capture=True)
-        if any(line.split()[1] == name for line in out.splitlines()):
+def wait_sink(name):
+    print(f"[*] Waiting indefinitely for sink: {name}")
+
+    # First check immediately in case it already exists
+    out = run_cmd(['pactl', 'list', 'short', 'sinks'], capture=True)
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == name:
+            print(f"[✓] Sink already present: {name}")
             return
-        time.sleep(delay)
-    print(f"[FATAL] Missing hardware sink: {name}", file=sys.stderr)
-    sys.exit(1)
+
+    # True event-based wait
+    sub = subprocess.Popen(
+        ['pactl', 'subscribe'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1
+    )
+
+    try:
+        for line in sub.stdout:
+            if "Event 'new' on sink" in line or "Event 'change' on sink" in line:
+                out = run_cmd(['pactl', 'list', 'short', 'sinks'], capture=True)
+                for s in out.splitlines():
+                    parts = s.split()
+                    if len(parts) >= 2 and parts[1] == name:
+                        print(f"[✓] Sink detected via event: {name}")
+                        return
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted while waiting for sink.")
+        sys.exit(0)
+    finally:
+        try:
+            sub.kill()
+        except:
+            pass
 
 
 def create_null_sink(name, desc):
-    sid = run_cmd([
+    return run_cmd([
         'pactl', 'load-module', 'module-null-sink',
         f'sink_name={name}', f'sink_properties=device.description={desc}'
     ], capture=True)
-    return sid
 
-
+# Updated create_loopback: duplicates working channel to broken one
 def create_loopback(source_sink, target_sink, channel, latency):
-    mapping = get_map(channel)
-    cmd = [
-        'pactl', 'load-module', 'module-loopback',
-        f'source={source_sink}.monitor', f'sink={target_sink}',
-        f'latency_msec={latency}', 'volume=0x10000'
-    ]
-    if mapping:
-        cmd.append(mapping)
-    return run_cmd(cmd, capture=True)
+    if target_sink == TARGET2:
+        if channel == 'left':
+            # RIGHT → LEFT
+            cmd = [
+                'pactl', 'load-module', 'module-loopback',
+                f'source={source_sink}.monitor',
+                f'sink={target_sink}',
+                'channels=2',
+                'remix=no',
+                'channel_map=front-right,front-right',
+                f'latency_msec={latency}',
+                'volume=0x10000'
+            ]
+        elif channel == 'right':
+            # LEFT → RIGHT
+            cmd = [
+                'pactl', 'load-module', 'module-loopback',
+                f'source={source_sink}.monitor',
+                f'sink={target_sink}',
+                'channels=2',
+                'remix=no',
+                'channel_map=front-left,front-left',
+                f'latency_msec={latency}',
+                'volume=0x10000'
+            ]
+        else:
+            # both healthy
+            cmd = [
+                'pactl', 'load-module', 'module-loopback',
+                f'source={source_sink}.monitor',
+                f'sink={target_sink}',
+                'channels=2',
+                'remix=yes',
+                f'latency_msec={latency}',
+                'volume=0x10000'
+            ]
+    else:
+        # ASHA or other sinks
+        mapping = get_map(channel)
+        cmd = [
+            'pactl', 'load-module', 'module-loopback',
+            f'source={source_sink}.monitor',
+            f'sink={target_sink}',
+            f'latency_msec={latency}',
+            'volume=0x10000'
+        ]
+        if mapping:
+            cmd.append(mapping)
 
+    return run_cmd(cmd, capture=True)
 
 def get_vol(name):
     out = run_cmd(['pactl', 'get-sink-volume', name], capture=True)
@@ -97,18 +163,13 @@ def get_vol(name):
             return line.split()[4]
     return None
 
-
 def set_vol(name, vol):
     run_cmd(['pactl', 'set-sink-volume', name, vol])
 
-
 def extract_mac_from_sink(sink_name):
-    # Example: bluez_output.2C_53_D7_7B_47_2D.1
     match = re.search(r'bluez_output\.([0-9A-Fa-f_]+)\.\d+', sink_name)
-    if not match:
-        return None
+    if not match: return None
     return match.group(1).replace('_', ':')
-
 
 def try_reconnect_bt():
     mac = extract_mac_from_sink(TARGET2)
@@ -122,8 +183,6 @@ def try_reconnect_bt():
     except subprocess.CalledProcessError:
         print("[ERROR] Failed to reconnect using bluetoothctl", file=sys.stderr)
 
-
-# === CLEANUP ===
 def cleanup():
     print("[*] Cleaning up...")
     for mod in (LB1, LB2, ID_COMB, ID1, ID2):
@@ -142,32 +201,107 @@ def cleanup():
         print("[WARN] Failed to restore default sink", file=sys.stderr)
     print("[✓] Cleanup complete.")
 
-
-# === MONITOR THREAD ===
 def monitor_sinks():
-    sub = subprocess.Popen(['pactl', 'subscribe'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    for line in iter(sub.stdout.readline, b''):
-        if stop_flag.is_set():
-            break
-        decoded = line.decode().strip()
-        if "Event 'remove' on sink" in decoded and TARGET2 in decoded:
-            print(f"[!] Target sink {TARGET2} was removed!")
-            if args.reconnect:
-                try_reconnect_bt()
-                print("[*] Waiting for sink to reappear...")
-                try:
-                    wait_sink(TARGET2, retries=25, delay=0.5)
-                    print("[✓] BT sink reappeared. Continue running.")
-                    continue  # Continue monitoring
-                except SystemExit:
-                    print("[FATAL] BT sink did not reappear.")
-            stop_flag.set()
-            os.kill(os.getpid(), signal.SIGINT)
-            break
-    sub.kill()
+    """
+    Fully dynamic monitor for ASHA + BT sinks.
+    - Handles disconnect/reconnect of ASHA and BT
+    - Reapplies loopbacks and updates combined sink slaves
+    - Event-driven; no polling
+    """
+    global LB1, LB2, ID_COMB
+
+    sub = subprocess.Popen(['pactl', 'subscribe'],
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL,
+                           text=True,
+                           bufsize=1)
+
+    try:
+        for line in sub.stdout:
+            if stop_flag.is_set():
+                break
+            decoded = line.strip()
+
+            # --------------------
+            # ASHA removal
+            # --------------------
+            if "Event 'remove' on sink" in decoded and TARGET1 in decoded:
+                print(f"[!] ASHA sink {TARGET1} removed! Waiting for it...")
+                LB1 = None
+
+                # Wait for ASHA to reappear
+                wait_sink(TARGET1)
+                print(f"[✓] ASHA sink {TARGET1} reappeared!")
+
+                # Reapply loopback
+                LB1 = create_loopback(SINK1, TARGET1, CHAN1, LAT1)
+                print(f"[*] ASHA loopback reapplied to {TARGET1}")
+
+                # Update combined sink slaves
+                slaves = [SINK1]
+                out = run_cmd(['pactl', 'list', 'short', 'sinks'], capture=True)
+                if any(line.split()[1] == TARGET2 for line in out.splitlines()) and LB2:
+                    slaves.append(SINK2)
+                run_cmd(['pactl', 'set-sink-slaves', COMB, ','.join(slaves)])
+                print(f"[✓] Combined sink {COMB} updated after ASHA reconnect")
+
+            # --------------------
+            # BT removal
+            # --------------------
+            elif "Event 'remove' on sink" in decoded and TARGET2 in decoded:
+                print(f"[!] BT sink {TARGET2} removed!")
+                if args.reconnect:
+                    try_reconnect_bt()
+                if LB2:
+                    try:
+                        run_cmd(['pactl', 'unload-module', LB2], check=False)
+                        LB2 = None
+                    except:
+                        pass
+
+                # Update combined sink slaves to remove BT
+                run_cmd(['pactl', 'set-sink-slaves', COMB, SINK1])
+                print(f"[✓] Combined sink {COMB} updated after BT removal")
+
+            # --------------------
+            # New/changed sink (BT or ASHA reappearance)
+            # --------------------
+            elif "Event 'new' on sink" in decoded or "Event 'change' on sink" in decoded:
+                out = run_cmd(['pactl', 'list', 'short', 'sinks'], capture=True)
+
+                # BT appeared
+                if any(line.split()[1] == TARGET2 for line in out.splitlines()) and not LB2:
+                    print(f"[✓] BT sink {TARGET2} appeared!")
+                    LB2 = create_loopback(SINK2, TARGET2, CHAN2, LAT2)
+                    print(f"[*] BT loopback applied to {TARGET2}")
+
+                    # Add BT to combined sink
+                    slaves = [SINK1, SINK2]
+                    run_cmd(['pactl', 'set-sink-slaves', COMB, ','.join(slaves)])
+                    print(f"[✓] BT sink {TARGET2} added to combined sink {COMB}")
+
+                # ASHA appeared (if somehow LB1 is missing)
+                if any(line.split()[1] == TARGET1 for line in out.splitlines()) and not LB1:
+                    print(f"[✓] ASHA sink {TARGET1} appeared unexpectedly!")
+                    LB1 = create_loopback(SINK1, TARGET1, CHAN1, LAT1)
+                    print(f"[*] ASHA loopback reapplied to {TARGET1}")
+
+                    # Ensure combined sink includes ASHA (and BT if exists)
+                    slaves = [SINK1]
+                    if any(line.split()[1] == TARGET2 for line in out.splitlines()) and LB2:
+                        slaves.append(SINK2)
+                    run_cmd(['pactl', 'set-sink-slaves', COMB, ','.join(slaves)])
+                    print(f"[✓] Combined sink {COMB} updated after ASHA addition")
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            sub.kill()
+        except:
+            pass
 
 
-# === MAIN ===
 def main():
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
@@ -223,7 +357,6 @@ def main():
 
     finally:
         cleanup()
-
 
 if __name__ == '__main__':
     main()
