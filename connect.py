@@ -1005,9 +1005,14 @@ class BluetoothAshaManager:
 
 		# Determine device type
 		device_type = self.device_manager.get_device_type(name)
-		
-		# Check if we should connect this device based on connection rules and mode
+
 		if not self.device_manager.should_connect_device(device_type, self.operation_mode):
+			with global_lock:
+				skip_key = f"{mac}_{device_type}_{self.operation_mode}"
+				
+				if skip_key in processed_devices:
+					return
+				processed_devices.add(skip_key)
 			if self.operation_mode == "primary_only" and device_type == "secondary":
 				logger.info(f"Skipping secondary device {name} - PRIMARY ONLY mode enabled")
 			elif self.operation_mode == "secondary_only" and device_type == "primary":
@@ -1029,8 +1034,6 @@ class BluetoothAshaManager:
 			else:
 				logger.info(f"Skipping {device_type} device {name} - connection limit reached")
 			
-			with global_lock:
-				processed_devices.discard(mac)
 			return
 
 		# Check if we can connect more devices (general limit)
@@ -1859,5 +1862,4 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
-
 
