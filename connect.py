@@ -261,8 +261,8 @@ ALL_DEVICE_FILTERS = [device for device in ALL_DEVICE_FILTERS if device]
 # if SECONDARY_DEVICES:
 # 	logger.info(f"Secondary devices: {SECONDARY_DEVICES}")
 # logger.info(f"Max simultaneous devices: {MAX_DEVICES}")
-if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
-	logger.info(f"Secondary reconnection: {SECONDARY_RECONNECTION_MODE} mode (initial: {SECONDARY_INITIAL_DELAY}s, max: {SECONDARY_MAX_DELAY}s)")
+# if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
+#	logger.info(f"Secondary reconnection: {SECONDARY_RECONNECTION_MODE} mode (initial: {SECONDARY_INITIAL_DELAY}s, max: {SECONDARY_MAX_DELAY}s)")
 
 # GATT Configuration
 GATT_ATTRIBUTE: str = config["GATT"]["Volume"]["ID"] or "00e4ca9e-ab14-41e4-8823-f9e70c7e91df"
