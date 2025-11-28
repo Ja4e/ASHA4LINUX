@@ -86,6 +86,8 @@ Usually, if connection return try to restart this device and try to rerun the sc
 """
 This script aims to assist all annonying G.722 bluetooth connection issues 
 """
+#!/usr/bin/env python3
+
 import os
 import pty
 import subprocess
@@ -99,7 +101,7 @@ import re
 import asyncio
 import random
 import logging
-from typing import List, Tuple, Optional, Set, Dict
+from typing import List, Tuple, Optional, Set, Dict, Any
 from colorama import init as colorama_init, Fore, Style
 import dbus
 import dbus.exceptions
@@ -109,8 +111,14 @@ from gi.repository import GLib
 import fcntl
 import termios
 import json
+import psutil
 
 colorama_init(autoreset=True)
+
+# ------------------------------
+# GLOBAL LOCK FOR THREAD SAFETY
+# ------------------------------
+global_lock = threading.RLock()
 
 # ------------------------------
 # Logging Setup
@@ -125,69 +133,57 @@ logger = logging.getLogger(__name__)
 # ------------------------------
 # CONFIGURATION
 # ------------------------------
-config_path = "~/.config/asha_manager/config.json" # This is the config_path you will have them implemented
+config_path = "~/.config/asha_manager/config1.json"
 
 def load_config(config_path: str) -> dict:
 	"""
 	Load configuration from JSON file, merging defaults with user overrides.
-	If file does not exist or is invalid, create/write it with default settings.
 	"""
-
 	def get_default_config() -> dict:
 		return {
 			"Devices": {
-				"Primary": [
-					"",
-				],
-				"Secondary": [
-					"",
-				],
+				"Primary": [""],
+				"Secondary": [""],
 			},
-			
 			"global": {
 				"Separate_boolean": True,
 				"Filter_DFU": True,
 				"Max_Devices": 2,
 				"Priority_Primary": True,
 			},
-			
 			"GATT": {
 				"Allow": True,
 				"Volume": {
-					"ID": "00e4ca9e-ab14-41e4-8823-f9e70c7e91df", # Change it if needed
+					"ID": "00e4ca9e-ab14-41e4-8823-f9e70c7e91df",
 					"Value": "0xff",
 				},
-				"Trigger": { # Only select one
-					"Boolean": True, 
-					"Modes": "increment", # Very pratical very Recommended it acts like delay = (Duration + Frequency_int) i a loop  or "Burst", The burst functionalities is very periodic no irregularities very useful However it will cause stupid unecessary bandwidth bluetooth LE filling up causing problematic control bandwidth flow. 
-					"Duration_s": 0.3, # have to up to 0.2 lower than 0.2 will fail in transmitting  0.3 is recommended for stable audio transmitting
+				"Trigger": {
+					"Boolean": True,
+					"Modes": "increment",
+					"Duration_s": 0.3,
 				},
-				"Frequency_int": 1, # tring 1 call is enough
-				"Detect_loss": False, # Will add more options to fine-tune 
+				"Frequency_int": 1,
+				"Detect_loss": False,
 				"Per_Device_Volume": True
 			},
-			
-			"DELAY": {  # Please ignore these part 
+			"DELAY": {
 				"RETRY": "R",
 				"DEFAULT_RETRY": 0.0,
 				"MAX_TIMEOUT": "R",
 				"Timeout_qs": "R",
 			},
-			
 			"Reconnection": {
 				"Secondary": {
 					"Enabled": True,
-					"Mode": "incremental",  # incremental, periodic, exponential
+					"Mode": "incremental",
 					"Initial_Delay": 5.0,
 					"Max_Delay": 60.0,
 					"Max_Attempts": 10,
 					"Backoff_Multiplier": 1.5
 				}
 			},
-			
 			"Blacklist": [
 				"AudioStream Adapter DFU",
-				# Add anything you needed
 			]
 		}
 
@@ -199,45 +195,33 @@ def load_config(config_path: str) -> dict:
 				default[key] = value
 
 	def migrate_old_config(config: dict) -> dict:
-		"""
-		Migrate old config format (single strings) to new format (lists)
-		"""
 		devices = config.get("Devices", {})
-		
-		# Check if Primary is a string and convert to list
 		if "Primary" in devices and isinstance(devices["Primary"], dict):
 			primary_name = devices["Primary"].get("Name", "")
 			if primary_name and isinstance(primary_name, str):
 				config["Devices"]["Primary"] = [primary_name] if primary_name else []
-		
 		if "Secondary" in devices and isinstance(devices["Secondary"], dict):
 			secondary_name = devices["Secondary"].get("Name", "")
 			if secondary_name and isinstance(secondary_name, str):
 				config["Devices"]["Secondary"] = [secondary_name] if secondary_name else []
-				
 		return config
 
 	default_config = get_default_config()
-
-	# Ensure the config directory exists
 	os.makedirs(os.path.dirname(config_path), exist_ok=True)
 
 	if os.path.isfile(config_path):
 		try:
 			with open(config_path, 'r') as f:
 				user_config = json.load(f)
-			
-			# Migrate old config format if needed
 			user_config = migrate_old_config(user_config)
 			deep_merge(default_config, user_config)
-			
 		except (json.JSONDecodeError, IOError) as e:
 			logging.warning(f"[config] Failed to load config, using defaults: {e}")
 	else:
 		try:
 			with open(config_path, 'w') as f:
 				json.dump(default_config, f, indent=4)
-			logging.info(f"[config] Created default config at: {config_path}")  # Will be logged if first time
+			logging.info(f"[config] Created default config at: {config_path}")
 		except IOError as e:
 			logging.error(f"[config] Failed to write default config: {e}")
 
@@ -246,10 +230,6 @@ def load_config(config_path: str) -> dict:
 # Path to configuration file
 CONFIG_PATH = os.path.expanduser(config_path)
 config = load_config(CONFIG_PATH)
-
-"""
-DEVICES
-"""
 
 # Extract device lists from config
 PRIMARY_DEVICES: List[str] = config["Devices"].get("Primary", [])
@@ -284,10 +264,7 @@ logger.info(f"Max simultaneous devices: {MAX_DEVICES}")
 if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
 	logger.info(f"Secondary reconnection: {SECONDARY_RECONNECTION_MODE} mode (initial: {SECONDARY_INITIAL_DELAY}s, max: {SECONDARY_MAX_DELAY}s)")
 
-"""
-GATT
-"""
-
+# GATT Configuration
 GATT_ATTRIBUTE: str = config["GATT"]["Volume"]["ID"] or "00e4ca9e-ab14-41e4-8823-f9e70c7e91df"
 PER_DEVICE_VOLUME: bool = config["GATT"].get("Per_Device_Volume", True)
 
@@ -310,30 +287,188 @@ Timeout_qs: float = random.uniform(80000, 100000)
 # Blacklist devices to avoid
 BLACKLIST: list = config.get("Blacklist", [])
 
-# Global state (protected by locks where needed)
+# ------------------------------
+# THREAD-SAFE GLOBAL STATE
+# ------------------------------
+# All access MUST use global_lock
 processed_devices: Set[str] = set()
-connected_devices_lock = threading.Lock()
-processed_lock = threading.Lock()
-# Enhanced device tracking with type information
 connected_devices: Dict[str, Dict] = {}  # mac -> {name, volume, last_seen, device_type, priority}
 
-# Threading & process events
+# Threading & process events (thread-safe by design)
 shutdown_evt = threading.Event()
 reconnect_evt = threading.Event()
 reset_evt = threading.Event()
 asha_restart_evt = threading.Event()
 
+# ASHA process state (protected by global_lock)
 asha_handle: Optional[Tuple[int, int]] = None
 asha_started: bool = False
 
-# NEW: Connection state tracking
+# Connection state tracking (thread-safe by design)
 primary_connection_in_progress = threading.Event()
 secondary_connection_in_progress = threading.Event()
 
-# NEW: Secondary reconnection tracking
-secondary_reconnection_attempts: Dict[str, Dict] = {}  # mac -> {attempts, next_attempt_time, delay}
-secondary_reconnection_lock = threading.Lock()
-logged_secondary_no_primary: Set[str] = set()  # Track which devices have been logged for "no primary"
+# Secondary reconnection tracking (protected by global_lock)
+secondary_reconnection_attempts: Dict[str, Dict] = {}
+logged_secondary_no_primary: Set[str] = set()
+
+# ------------------------------
+# ASYNC EVENT LOOP MANAGEMENT
+# ------------------------------
+class AsyncEventLoopManager:
+	"""Thread-safe async event loop management"""
+	def __init__(self):
+		self.loop: Optional[asyncio.AbstractEventLoop] = None
+		self.thread: Optional[threading.Thread] = None
+		self._started = False
+		
+	def start(self):
+		"""Start the async event loop in a dedicated thread"""
+		with global_lock:
+			if self._started:
+				return
+				
+			self.loop = asyncio.new_event_loop()
+			self.thread = threading.Thread(target=self._run_loop, daemon=True)
+			self.thread.start()
+			self._started = True
+			logger.info("Async event loop started")
+			
+	def _run_loop(self):
+		"""Run the event loop (to be called in dedicated thread)"""
+		asyncio.set_event_loop(self.loop)
+		try:
+			self.loop.run_forever()
+		finally:
+			self.loop.close()
+			
+	def stop(self):
+		"""Stop the async event loop"""
+		with global_lock:
+			if not self._started or not self.loop:
+				return
+				
+			self.loop.call_soon_threadsafe(self.loop.stop)
+			if self.thread:
+				self.thread.join(timeout=5.0)
+			self._started = False
+			logger.info("Async event loop stopped")
+			
+	def run_coroutine_threadsafe(self, coro):
+		"""Run a coroutine in a thread-safe manner"""
+		if not self._started or not self.loop:
+			raise RuntimeError("Async event loop not started")
+		return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+# Global async manager
+async_manager = AsyncEventLoopManager()
+
+# ------------------------------
+# PROCESS MANAGEMENT UTILITIES
+# ------------------------------
+def is_asha_process_running() -> bool:
+	"""Check if ASHA sink process is already running"""
+	with global_lock:
+		try:
+			for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+				try:
+					if (proc.info['name'] and 'asha_pipewire_sink' in proc.info['name'].lower()):
+						return True
+					if (proc.info['cmdline'] and 
+						any('asha_pipewire_sink' in str(cmd).lower() for cmd in proc.info['cmdline'])):
+						return True
+				except (psutil.NoSuchProcess, psutil.AccessDenied):
+					continue
+		except Exception as e:
+			logger.warning(f"Process check failed: {e}")
+		return False
+
+def kill_existing_asha_processes() -> None:
+	"""Forcefully kill any existing ASHA sink processes"""
+	with global_lock:
+		try:
+			for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+				try:
+					if (proc.info['cmdline'] and 
+						any('asha_pipewire_sink' in str(cmd).lower() for cmd in proc.info['cmdline'])):
+						logger.warning(f"Killing existing ASHA process: {proc.info['pid']}")
+						os.kill(proc.info['pid'], signal.SIGKILL)
+						time.sleep(0.5)
+				except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+					continue
+		except Exception as e:
+			logger.error(f"Error killing existing processes: {e}")
+
+# ------------------------------
+# UTILITY FUNCTIONS
+# ------------------------------
+def run_command(command: str, check: bool = True, capture_output: bool = False,
+				input_text: Optional[str] = None, cwd: Optional[str] = None,
+				debug: bool = True) -> Optional[str]:
+	"""Run a shell command and return output if requested"""
+	if debug and DEBUG:
+		logger.debug(f"Running command: {Fore.BLUE}{command}{Style.RESET_ALL} [cwd={Fore.BLUE}{cwd}{Style.RESET_ALL}]")
+	try:
+		result = subprocess.run(
+			command,
+			shell=True,
+			check=check,
+			text=True,
+			capture_output=capture_output,
+			input=input_text,
+			cwd=cwd
+		)
+		return result.stdout.strip() if capture_output else None
+	except subprocess.CalledProcessError as e:
+		if debug:
+			logger.error(f"Command error: {e}")
+		if capture_output and e.stdout:
+			return e.stdout.strip()
+		return None
+
+def run_trust_background(mac: str) -> None:
+	"""Launch `bluetoothctl trust <MAC>` in the background non-blocking"""
+	try:
+		subprocess.Popen(
+			["bluetoothctl", "trust", mac],
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception as e:
+		logger.warning(f"Failed to run bluetoothctl trust for {mac}: {e}")
+
+def run_pair_devices(mac: str) -> None:
+	"""Launch `bluetoothctl pair <MAC>` in the background non-blocking"""
+	try:
+		subprocess.Popen(
+			["bluetoothctl", "pair", mac],
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception as e:
+		logger.warning(f"Failed to run bluetoothctl pair for {mac}: {e}")
+		
+def run_remove_devices(mac: str) -> None:
+	"""Launch `bluetoothctl remove <MAC>` in the background non-blocking"""
+	try:
+		subprocess.Popen(
+			["bluetoothctl", "remove", mac],
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception as e:
+		logger.warning(f"Failed to run bluetoothctl remove for {mac}: {e}")
+
+def disable_pairable_background() -> None:
+	"""Launch `bluetoothctl pairable off` in the background non-blocking"""
+	try:
+		subprocess.Popen(
+			["bluetoothctl", "pairable", "off"],
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+		)
+	except Exception as e:
+		logger.warning(f"Failed to run bluetoothctl pairable off: {e}")
 
 # ------------------------------
 # DEVICE MANAGEMENT CLASS
@@ -344,15 +479,17 @@ class DeviceManager:
 		
 	def get_device_volume(self, mac: str, default_volume: str) -> str:
 		"""Get volume for specific device, with fallback to default"""
-		return self.device_volumes.get(mac, default_volume)
+		with global_lock:
+			return self.device_volumes.get(mac, default_volume)
 	
 	def set_device_volume(self, mac: str, volume: str) -> None:
 		"""Set volume for specific device"""
-		self.device_volumes[mac] = volume
-		
+		with global_lock:
+			self.device_volumes[mac] = volume
+			
 	def get_connected_count(self) -> int:
 		"""Get number of currently connected devices"""
-		with connected_devices_lock:
+		with global_lock:
 			return len(connected_devices)
 	
 	def can_connect_more(self) -> bool:
@@ -361,7 +498,7 @@ class DeviceManager:
 	
 	def is_device_connected(self, mac: str) -> bool:
 		"""Check if device is already connected"""
-		with connected_devices_lock:
+		with global_lock:
 			return mac in connected_devices
 	
 	def get_device_type(self, name: str) -> str:
@@ -390,7 +527,7 @@ class DeviceManager:
 		device_type = self.get_device_type(name)
 		priority = self.get_device_priority(device_type)
 		
-		with connected_devices_lock:
+		with global_lock:
 			connected_devices[mac] = {
 				'name': name,
 				'volume': config["GATT"]["Volume"]["Value"],
@@ -399,26 +536,27 @@ class DeviceManager:
 				'priority': priority
 			}
 		
-		# NEW: Clear connection in progress flags when connection succeeds
+		# Clear connection in progress flags when connection succeeds
 		if device_type == "primary":
 			primary_connection_in_progress.clear()
 		elif device_type == "secondary":
 			secondary_connection_in_progress.clear()
 			
-		# NEW: Clear reconnection tracking when device connects successfully
+		# Clear reconnection tracking when device connects successfully
 		if device_type == "secondary":
-			with secondary_reconnection_lock:
+			with global_lock:
 				if mac in secondary_reconnection_attempts:
 					del secondary_reconnection_attempts[mac]
 	
 	def remove_connected_device(self, mac: str) -> None:
 		"""Remove device from connected devices list"""
-		with connected_devices_lock:
+		device_type = None
+		with global_lock:
 			if mac in connected_devices:
 				device_type = connected_devices[mac]['device_type']
 				del connected_devices[mac]
 		
-		# NEW: Clear connection flags when device is removed
+		# Clear connection flags when device is removed
 		if device_type == "primary":
 			primary_connection_in_progress.clear()
 		elif device_type == "secondary":
@@ -426,30 +564,30 @@ class DeviceManager:
 	
 	def get_connected_devices_info(self) -> List[Tuple[str, str, str]]:
 		"""Get list of connected devices as (mac, name, type) tuples"""
-		with connected_devices_lock:
+		with global_lock:
 			return [(mac, data['name'], data['device_type']) for mac, data in connected_devices.items()]
 	
 	def get_connected_devices_by_priority(self) -> List[Tuple[str, str, str, int]]:
 		"""Get connected devices sorted by priority"""
-		with connected_devices_lock:
+		with global_lock:
 			devices = [(mac, data['name'], data['device_type'], data['priority']) 
 					  for mac, data in connected_devices.items()]
-			return sorted(devices, key=lambda x: x[3])  # Sort by priority
+			return sorted(devices, key=lambda x: x[3])
 	
 	def update_device_seen(self, mac: str) -> None:
 		"""Update last seen timestamp for device"""
-		with connected_devices_lock:
+		with global_lock:
 			if mac in connected_devices:
 				connected_devices[mac]['last_seen'] = time.time()
 	
 	def get_connected_primary_count(self) -> int:
 		"""Get number of connected primary devices"""
-		with connected_devices_lock:
+		with global_lock:
 			return sum(1 for data in connected_devices.values() if data['device_type'] == 'primary')
 	
 	def get_connected_secondary_count(self) -> int:
 		"""Get number of connected secondary devices"""
-		with connected_devices_lock:
+		with global_lock:
 			return sum(1 for data in connected_devices.values() if data['device_type'] == 'secondary')
 	
 	def is_primary_connected(self) -> bool:
@@ -463,7 +601,6 @@ class DeviceManager:
 	def should_connect_device(self, device_type: str, mode_override: Optional[str] = None) -> bool:
 		"""
 		Determine if we should connect a new device based on type and connection rules.
-		UPDATED: Never connect primary and secondary at the same time.
 		"""
 		if not self.can_connect_more():
 			return False
@@ -517,93 +654,10 @@ class DeviceManager:
 device_manager = DeviceManager()
 
 # ------------------------------
-# UTILITY FUNCTIONS
-# ------------------------------
-def run_command(command: str, check: bool = True, capture_output: bool = False,
-				input_text: Optional[str] = None, cwd: Optional[str] = None,
-				debug: bool = True) -> Optional[str]:
-	"""
-	Run a shell command and return output if requested.
-	"""
-	if debug and DEBUG:
-		logger.debug(f"Running command: {Fore.BLUE}{command}{Style.RESET_ALL} [cwd={Fore.BLUE}{cwd}{Style.RESET_ALL}]")
-	try:
-		result = subprocess.run(
-			command,
-			shell=True,
-			check=check,
-			text=True,
-			capture_output=capture_output,
-			input=input_text,
-			cwd=cwd
-		)
-		return result.stdout.strip() if capture_output else None
-	except subprocess.CalledProcessError as e:
-		if debug:
-			logger.error(f"Command error: {e}")
-		if capture_output and e.stdout:
-			return e.stdout.strip()
-		return None
-
-def run_trust_background(mac: str) -> None:
-	"""
-	Launch `bluetoothctl trust <MAC>` in the background non-blocking.
-	"""
-	try:
-		subprocess.Popen(
-			["bluetoothctl", "trust", mac],
-			stdout=subprocess.DEVNULL,
-			stderr=subprocess.DEVNULL,
-		)
-	except Exception as e:
-		logger.warning(f"Failed to run bluetoothctl trust for {mac}: {e}")
-
-def run_pair_devices(mac: str) -> None:
-	"""
-	Launch `bluetoothctl pair <MAC>` in the background non-blocking.
-	"""
-	try:
-		subprocess.Popen(
-			["bluetoothctl", "pair", mac],
-			stdout=subprocess.DEVNULL,
-			stderr=subprocess.DEVNULL,
-		)
-	except Exception as e:
-		logger.warning(f"Failed to run bluetoothctl pair for {mac}: {e}")
-		
-def run_remove_devices(mac: str) -> None:
-	"""
-	Launch `bluetoothctl remove <MAC>` in the background non-blocking.
-	"""
-	try:
-		subprocess.Popen(
-			["bluetoothctl", "remove", mac],
-			stdout=subprocess.DEVNULL,
-			stderr=subprocess.DEVNULL,
-		)
-	except Exception as e:
-		logger.warning(f"Failed to run bluetoothctl remove for {mac}: {e}")
-
-def disable_pairable_background() -> None:
-	"""
-	Launch `bluetoothctl pairable off` in the background non-blocking.
-	"""
-	try:
-		subprocess.Popen(
-			["bluetoothctl", "pairable", "off"],
-			stdout=subprocess.DEVNULL,
-			stderr=subprocess.DEVNULL,
-		)
-	except Exception as e:
-		logger.warning(f"Failed to run bluetoothctl pairable off: {e}")
-
-# ------------------------------
 # ADVERTISEMENT MANAGEMENT
 # ------------------------------
 class Advertisement(dbus.service.Object):
-	"""
-	Manages a Bluetooth LE advertisement via DBus.
-	"""
+	"""Manages a Bluetooth LE advertisement via DBus"""
 	PATH_BASE = '/org/bluez/example/advertisement'
 
 	def __init__(self, bus, index: int, ad_type: str, service_uuids: List[str],
@@ -644,9 +698,9 @@ class BluetoothAshaManager:
 		self.adv_loop = None
 		self.adv_thread = None
 		self.scan_thread: Optional[threading.Thread] = None
-		self.gatt_triggered: bool = False # Instance flag for GATT trigger
-		self.timer: bool = False # Introduced Timer to fix the stupid bugs
-		self.ad_registered: bool = False # Track advertisement registration status
+		self.gatt_triggered: bool = False
+		self.timer: bool = False
+		self.ad_registered: bool = False
 		self.device_manager = device_manager
 		
 		# Set volume value based on arguments and environment variable
@@ -655,26 +709,19 @@ class BluetoothAshaManager:
 			self.volume_value = env_volume
 			logger.info(f"{Fore.YELLOW}Using environment variable LND={env_volume} for volume (overrides config){Style.RESET_ALL}")
 		elif self.args.loudness:
-			# If --loudness is set but no LND env var, use configured value
 			self.volume_value = config["GATT"]["Volume"]["Value"]
 			logger.info(f"{Fore.YELLOW}Using configured volume value: {self.volume_value}{Style.RESET_ALL}")
 		else:
 			self.volume_value = config["GATT"]["Volume"]["Value"]
 			logger.info(f"Using configured volume value: {self.volume_value}")
 
-		# NEW: Determine operation mode from environment variables and command line
+		# Determine operation mode
 		self.operation_mode = self._determine_operation_mode()
 		
 	def _determine_operation_mode(self) -> Optional[str]:
-		"""
-		Determine operation mode from environment variables and command line arguments.
-		Priority: command line > environment > config/default
-		"""
-		# Check environment variables first
+		"""Determine operation mode from environment variables and command line arguments"""
 		env_primary_only = os.getenv("PRI_O")
 		env_secondary_only = os.getenv("SEC_O")
-		
-		# Check command line arguments
 		cli_primary_only = getattr(self.args, 'primary_only', False)
 		cli_secondary_only = getattr(self.args, 'secondary_only', False)
 		
@@ -692,16 +739,12 @@ class BluetoothAshaManager:
 			logger.info(f"{Fore.YELLOW}SECONDARY ONLY mode enabled via environment variable SECONDARY_ONLY={env_secondary_only}{Style.RESET_ALL}")
 			return "secondary_only"
 		
-		# Normal operation (both primary and secondary allowed)
 		logger.info("Normal operation mode (both primary and secondary devices allowed)")
 		return None
 
 	# Bluetooth Initialization
-
 	def initialize_bluetooth(self) -> None:
-		"""
-		Initialize Bluetooth by unblocking it, powering on, and setting up agents.
-		"""
+		"""Initialize Bluetooth by unblocking it, powering on, and setting up agents"""
 		logger.info(f"{Fore.BLUE}Initializing Bluetooth...{Style.RESET_ALL}")
 		run_command("rfkill unblock bluetooth")
 		run_command("bluetoothctl power on")
@@ -720,9 +763,7 @@ class BluetoothAshaManager:
 		logger.info(f"{Fore.GREEN}Bluetooth initialized{Style.RESET_ALL}")
 
 	def start_advertising(self, disable_advertisement: bool = False) -> None:
-		"""
-		Start Bluetooth LE advertising unless disabled. Logs the result of registration.
-		"""
+		"""Start Bluetooth LE advertising unless disabled"""
 		if disable_advertisement:
 			logger.info("Advertisement disabled via CLI argument")
 			return
@@ -730,12 +771,12 @@ class BluetoothAshaManager:
 		try:
 			dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 			bus = dbus.SystemBus()
-			adapter = bus.get_object('org.bluez', '/org/bluez/hci0') # Change if your Bluetooth adapter is under a different address
+			adapter = bus.get_object('org.bluez', '/org/bluez/hci0')
 			ad_manager = dbus.Interface(adapter, 'org.bluez.LEAdvertisingManager1')
 
 			self.ad_obj = Advertisement(
 				bus, 0, "peripheral",
-				[GATT_ATTRIBUTE], "ASHA Stream", ["tx-power"] # the "proper" advertising should not be a requirement but is good enough
+				[GATT_ATTRIBUTE], "ASHA Stream", ["tx-power"]
 			)
 
 			def register_reply_handler() -> None:
@@ -765,9 +806,7 @@ class BluetoothAshaManager:
 				os.execv(sys.executable, [sys.executable] + sys.argv)
 
 	def stop_advertising(self, disable_advertisement: bool = False) -> None:
-		"""
-		Stop active advertisement.
-		"""
+		"""Stop active advertisement"""
 		if disable_advertisement or not self.ad_obj:
 			return
 		try:
@@ -788,12 +827,8 @@ class BluetoothAshaManager:
 			logger.warning(f"Error stopping advertisement: {e}")
 
 	# Device Scanning and Connection
-
 	def get_matching_devices(self) -> List[Tuple[str, str]]:
-		"""
-		Query bluetoothctl devices and filter based on device lists.
-		Returns list of (mac, name) for devices matching primary or secondary lists.
-		"""
+		"""Query bluetoothctl devices and filter based on device lists"""
 		output = run_command("bluetoothctl devices", capture_output=True, debug=False) or ""
 		matching_devices = []
 		device_pattern = re.compile(r'^Device (([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}) (.*)$')
@@ -809,14 +844,12 @@ class BluetoothAshaManager:
 				for device_name in ALL_DEVICE_FILTERS:
 					if device_name and device_name in name:
 						matching_devices.append((mac, name))
-						break  # Avoid adding same device multiple times
+						break
 						
 		return matching_devices
 
 	def start_continuous_scan(self) -> None:
-		"""
-		Start continuous scan in a separate thread.
-		"""
+		"""Start continuous scan in a separate thread"""
 		def scan_worker() -> None:
 			new_pattern = re.compile(r'^\[NEW\] Device (([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}) (.*)$')
 			chg_pattern = re.compile(r'^\[CHG\] Device (([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}) Name: (.*)$')
@@ -864,7 +897,7 @@ class BluetoothAshaManager:
 							if not device_matches:
 								continue
 								
-							with processed_lock:
+							with global_lock:
 								if mac not in processed_devices:
 									processed_devices.add(mac)
 									threading.Thread(
@@ -890,10 +923,7 @@ class BluetoothAshaManager:
 		self.scan_thread.start()
 
 	async def async_connect_specific(self, mac_address: str, device_type: str) -> bool:
-		"""
-		Asynchronously attempt to connect to a given device up to three times.
-		UPDATED: Set connection in progress flags to prevent simultaneous connections.
-		"""
+		"""Asynchronously attempt to connect to a given device up to three times"""
 		# Set connection in progress flag
 		if device_type == "primary":
 			primary_connection_in_progress.set()
@@ -904,7 +934,7 @@ class BluetoothAshaManager:
 			return await asyncio.wait_for(self._connect_attempt(mac_address, device_type), timeout=MAX_TIMEOUT)
 		except asyncio.TimeoutError:
 			run_remove_devices(mac_address)
-			# UPDATED: Only trigger reset for primary device timeouts, not secondary
+			# Only trigger reset for primary device timeouts, not secondary
 			if device_type == "primary" and self.args.reset_on_failure:
 				logger.warning("Connection to primary %s timed out — reset-on-failure triggered", mac_address)
 				reset_evt.set()
@@ -946,10 +976,10 @@ class BluetoothAshaManager:
 
 			except Exception as e:
 				logger.error(f"Connection attempt exception for {device_type}: {e}")
-				# UPDATED: Only trigger reset for primary device exceptions, not secondary
+				# Only trigger reset for primary device exceptions, not secondary
 				if device_type == "primary" and self.args.reset_on_failure and not shutdown_evt.is_set():
 					logger.warning("All connection attempts failed — restarting via os.execv()")
-					reset_evt.set() # Signal main loop to handle reset
+					reset_evt.set()
 					try:
 						self.cleanup()
 					except Exception as e:
@@ -962,17 +992,14 @@ class BluetoothAshaManager:
 		return False
 
 	def handle_new_device(self, mac: str, name: str) -> None:
-		"""
-		Process a newly discovered device. Blacklisted devices are skipped.
-		UPDATED: Support PRIMARY_ONLY and SECONDARY_ONLY modes.
-		"""
+		"""Process a newly discovered device"""
 		if any(black in name for black in BLACKLIST):
 			logger.info(f"Device {name} ({mac}) is blacklisted. Skipping connection.")
 			return
 
 		if not re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac):
 			logger.error(f"Invalid MAC address: {mac}")
-			with processed_lock:
+			with global_lock:
 				processed_devices.discard(mac)
 			return
 
@@ -992,39 +1019,44 @@ class BluetoothAshaManager:
 			elif device_type == "secondary" and self.device_manager.is_secondary_connected():
 				logger.info(f"Skipping secondary device {name} - another secondary device is already connected")
 			elif device_type == "secondary" and not self.device_manager.is_primary_connected() and self.operation_mode != "secondary_only":
-				# UPDATED: Only log this if we already have at least one device connected
-				# This prevents the spam before the first device connects
 				if self.device_manager.get_connected_count() > 0:
-					global logged_secondary_no_primary
-					if mac not in logged_secondary_no_primary:
-						logger.info(f"Skipping secondary device {name} - no primary device connected yet")
-						logged_secondary_no_primary.add(mac)
-				# If no devices are connected yet, just skip silently
+					with global_lock:
+						if mac not in logged_secondary_no_primary:
+							logger.info(f"Skipping secondary device {name} - no primary device connected yet")
+							logged_secondary_no_primary.add(mac)
 			elif device_type == "secondary" and (primary_connection_in_progress.is_set() or secondary_connection_in_progress.is_set()):
 				logger.info(f"Skipping secondary device {name} - connection in progress")
 			else:
 				logger.info(f"Skipping {device_type} device {name} - connection limit reached")
 			
-			with processed_lock:
+			with global_lock:
 				processed_devices.discard(mac)
 			return
 
 		# Check if we can connect more devices (general limit)
 		if not self.device_manager.can_connect_more():
 			logger.info(f"Maximum device limit ({MAX_DEVICES}) reached. Skipping {name}")
-			with processed_lock:
+			with global_lock:
 				processed_devices.discard(mac)
 			return
 
 		# Check if device is already connected
 		if self.device_manager.is_device_connected(mac):
 			logger.debug(f"Device {name} ({mac}) is already connected")
-			with processed_lock:
+			with global_lock:
 				processed_devices.discard(mac)
 			return
 
 		logger.info(f"{Fore.BLUE}New {device_type} device detected: {name} ({mac}){Style.RESET_ALL}")
-		success = asyncio.run(self.async_connect_specific(mac, device_type))
+		
+		# Use thread-safe async execution
+		try:
+			future = async_manager.run_coroutine_threadsafe(self.async_connect_specific(mac, device_type))
+			success = future.result(timeout=MAX_TIMEOUT + 10)  # Add buffer for safety
+		except Exception as e:
+			logger.error(f"Async connection failed: {e}")
+			success = False
+
 		if success:
 			self.device_manager.add_connected_device(mac, name)
 			run_pair_devices(mac)
@@ -1034,25 +1066,23 @@ class BluetoothAshaManager:
 			actual_device_type = self.device_manager.get_device_type(name)
 			logger.info(f"{Fore.GREEN}Connected to {name} ({mac}) as {actual_device_type}!{Style.RESET_ALL}")
 			
-			# NEW: Start ASHA immediately when primary connects, regardless of secondary
-			# In SECONDARY_ONLY mode, don't start ASHA for primary devices
+			# Start ASHA immediately when primary connects
 			if actual_device_type == "primary" and self.operation_mode != "secondary_only":
-				global asha_handle, asha_started
-				if not asha_handle and not asha_started:
-					logger.info(f"{Fore.GREEN}Primary device connected - starting ASHA sink{Style.RESET_ALL}")
-					asha_handle = self.start_asha()
-					asha_started = True
-					threading.Thread(
-						target=self.stream_asha_output,
-						args=(asha_handle,),
-						daemon=True
-					).start()
-					
-					# NEW: Start secondary reconnection worker when primary connects
-					# Skip in PRIMARY_ONLY mode
-					if (SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES and 
-						self.operation_mode != "primary_only"):
-						self.start_secondary_reconnection_worker()
+				with global_lock:
+					if not asha_handle and not asha_started:
+						logger.info(f"{Fore.GREEN}Primary device connected - starting ASHA sink{Style.RESET_ALL}")
+						asha_handle = self.start_asha()
+						asha_started = True
+						threading.Thread(
+							target=self.stream_asha_output,
+							args=(asha_handle,),
+							daemon=True
+						).start()
+						
+						# Start secondary reconnection worker when primary connects
+						if (SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES and 
+							self.operation_mode != "primary_only"):
+							self.start_secondary_reconnection_worker()
 			
 			# Log connection summary
 			status_summary = self.device_manager.get_connection_status_summary()
@@ -1063,7 +1093,7 @@ class BluetoothAshaManager:
 			run_command("bluetoothctl discoverable off")
 			run_command("bluetoothctl scan off")
 		else:
-			# UPDATED: Only trigger reset for primary device failures, not secondary
+			# Only trigger reset for primary device failures, not secondary
 			if device_type == "primary" and self.args.reset_on_failure:
 				logger.warning("Failed to connect to primary %s — reset-on-failure triggered", mac)
 				reset_evt.set()
@@ -1076,17 +1106,15 @@ class BluetoothAshaManager:
 			else:
 				logger.warning(f"Failed to connect to {device_type} device {name}")
 				
-			with processed_lock:
+			with global_lock:
 				processed_devices.discard(mac)
 
 	def track_secondary_reconnection(self, mac: str, name: str) -> None:
-		"""
-		Track secondary device for reconnection attempts.
-		"""
+		"""Track secondary device for reconnection attempts"""
 		if not SECONDARY_RECONNECTION_ENABLED or self.operation_mode == "primary_only":
 			return
 			
-		with secondary_reconnection_lock:
+		with global_lock:
 			if mac not in secondary_reconnection_attempts:
 				secondary_reconnection_attempts[mac] = {
 					'name': name,
@@ -1118,10 +1146,7 @@ class BluetoothAshaManager:
 				logger.info(f"Scheduled reconnection to {name} in {tracking['current_delay']:.1f}s (attempt {tracking['attempts'] + 1})")
 
 	def start_secondary_reconnection_worker(self) -> None:
-		"""
-		Event-based secondary reconnection worker that only runs when primary is connected.
-		Skip in PRIMARY_ONLY mode.
-		"""
+		"""Event-based secondary reconnection worker"""
 		if self.operation_mode == "primary_only":
 			return
 			
@@ -1133,14 +1158,13 @@ class BluetoothAshaManager:
 					# Only run if primary is connected and we have secondary devices to reconnect
 					# In SECONDARY_ONLY mode, we don't need primary to be connected
 					if ((self.operation_mode == "secondary_only" or self.device_manager.is_primary_connected()) and 
-						not self.device_manager.is_secondary_connected() and
-						secondary_reconnection_attempts):
+						not self.device_manager.is_secondary_connected()):
 						
 						current_time = time.time()
 						devices_to_reconnect = []
 						
 						# Find devices ready for reconnection
-						with secondary_reconnection_lock:
+						with global_lock:
 							for mac, tracking in list(secondary_reconnection_attempts.items()):
 								if (current_time >= tracking['next_attempt_time'] and 
 									tracking['attempts'] < SECONDARY_MAX_ATTEMPTS):
@@ -1152,7 +1176,7 @@ class BluetoothAshaManager:
 								break
 								
 							# Check if we're already trying to process this device
-							with processed_lock:
+							with global_lock:
 								if mac in processed_devices:
 									continue
 								processed_devices.add(mac)
@@ -1168,14 +1192,17 @@ class BluetoothAshaManager:
 							time.sleep(1)
 					
 					# Check more frequently when we have pending reconnections
-					if secondary_reconnection_attempts:
-						time.sleep(2)  # Check every 2 seconds when active
+					with global_lock:
+						has_pending = bool(secondary_reconnection_attempts)
+					
+					if has_pending:
+						time.sleep(2)
 					else:
-						time.sleep(5)  # Check every 5 seconds when idle
+						time.sleep(5)
 						
 				except Exception as e:
 					logger.error(f"Secondary reconnection worker error: {e}")
-					time.sleep(10)  # Longer wait on error
+					time.sleep(10)
 
 		# Start the worker thread
 		threading.Thread(target=reconnection_worker, daemon=True).start()
@@ -1184,65 +1211,107 @@ class BluetoothAshaManager:
 	def start_asha(self) -> Tuple[int, int]:
 		"""
 		Ensure the ASHA sink repository is available, build the executable if needed,
-		then start it in a new process group.
+		then start it in a new process group with safety checks to prevent duplicates.
 		"""
-		logger.info(f"{Fore.BLUE}Initializing ASHA sink...{Style.RESET_ALL}")
-		if not os.path.isdir(CLONE_DIR):
-			logger.info("Cloning repository...")
-			run_command(f"git clone {REPO_URL} {CLONE_DIR}")
-
-		if not os.path.isfile(EXECUTABLE):
-			logger.info("Building ASHA sink...")
-			os.makedirs(BUILD_DIR, exist_ok=True)
-			run_command("cmake ..", cwd=BUILD_DIR)
-			run_command("make", cwd=BUILD_DIR)
-
-		try:
-			# Check if cap_net_raw is already set
-			result = subprocess.run(["getcap", EXECUTABLE], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+		# CRITICAL: Check for and kill any existing ASHA processes first
+		with global_lock:
+			if is_asha_process_running():
+				logger.warning("Existing ASHA process detected - terminating before start")
+				kill_existing_asha_processes()
+				time.sleep(1)
 			
-			if f"{EXECUTABLE} cap_net_raw=ep" not in result.stdout.strip():
-				logger.info("Setting cap_net_raw=ep on ASHA sink executable...")
-				subprocess.run(["sudo", "/usr/sbin/setcap", "cap_net_raw=ep", EXECUTABLE], check=True)
-			else:
-				logger.info("ASHA sink already has cap_net_raw=ep.")
-				
-		except subprocess.CalledProcessError as e:
-			logger.error(f"Failed to set/get capabilities: {e}")
+			# Double-check after cleanup
+			if is_asha_process_running():
+				logger.error("ASHA processes still running after cleanup - aborting start")
+				raise RuntimeError("Cannot start ASHA: existing processes still running")
+			
+			logger.info(f"{Fore.BLUE}Initializing ASHA sink...{Style.RESET_ALL}")
+			
+			if not os.path.isdir(CLONE_DIR):
+				logger.info("Cloning repository...")
+				run_command(f"git clone {REPO_URL} {CLONE_DIR}")
 
-		logger.info("Starting ASHA sink...")
-		master_fd, slave_fd = pty.openpty()
-		try:
-			proc = subprocess.Popen(
-				["stdbuf", "-oL", EXECUTABLE, "--buffer_algorithm", "threaded", "--phy2m"],  #can be changed to --phy1m
-				preexec_fn=os.setsid,
-				stdin=slave_fd,
-				stdout=slave_fd,
-				stderr=slave_fd,
-				close_fds=True
-			)
-			os.close(slave_fd)
-			# Set the master_fd to non-blocking mode
-			flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-			fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-			return proc.pid, master_fd
-		except Exception as e:
-			logger.error(f"ASHA startup failed: {e}")
-			os.close(master_fd)
-			raise
+			if not os.path.isfile(EXECUTABLE):
+				logger.info("Building ASHA sink...")
+				os.makedirs(BUILD_DIR, exist_ok=True)
+				run_command("cmake ..", cwd=BUILD_DIR)
+				run_command("make", cwd=BUILD_DIR)
+
+			try:
+				# Check if cap_net_raw is already set
+				result = subprocess.run(["getcap", EXECUTABLE], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+				
+				if f"{EXECUTABLE} cap_net_raw=ep" not in result.stdout.strip():
+					logger.info("Setting cap_net_raw=ep on ASHA sink executable...")
+					subprocess.run(["sudo", "/usr/sbin/setcap", "cap_net_raw=ep", EXECUTABLE], check=True)
+				else:
+					logger.info("ASHA sink already has cap_net_raw=ep.")
+					
+			except subprocess.CalledProcessError as e:
+				logger.error(f"Failed to set/get capabilities: {e}")
+
+			logger.info("Starting ASHA sink...")
+			
+			# FINAL CHECK before starting
+			if is_asha_process_running():
+				logger.error("ASHA process detected at final check - aborting")
+				raise RuntimeError("ASHA process already running")
+			
+			master_fd, slave_fd = pty.openpty()
+			try:
+				proc = subprocess.Popen(
+					["stdbuf", "-oL", EXECUTABLE, "--buffer_algorithm", "threaded", "--phy2m"],
+					preexec_fn=os.setsid,
+					stdin=slave_fd,
+					stdout=slave_fd,
+					stderr=slave_fd,
+					close_fds=True
+				)
+				os.close(slave_fd)
+				
+				# Verify process started and is running
+				time.sleep(0.5)
+				if proc.poll() is not None:
+					raise RuntimeError(f"ASHA process terminated immediately with code: {proc.returncode}")
+				
+				# Set the master_fd to non-blocking mode
+				flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+				fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+				
+				logger.info(f"{Fore.GREEN}ASHA sink started successfully (PID: {proc.pid}){Style.RESET_ALL}")
+				return proc.pid, master_fd
+				
+			except Exception as e:
+				logger.error(f"ASHA startup failed: {e}")
+				os.close(master_fd)
+				# Ensure process is terminated if it started but then failed
+				try:
+					if 'proc' in locals():
+						proc.terminate()
+						proc.wait(timeout=2)
+				except:
+					pass
+				raise
 
 	def stream_asha_output(self, asha_handle: Tuple[int, int]) -> None:
 		"""
 		Reads the ASHA output and watches for connection drops or GATT triggers.
 		"""
 		child_pid, master_fd = asha_handle
+		
+		# Validate process is actually running
+		try:
+			os.kill(child_pid, 0)
+		except ProcessLookupError:
+			logger.error("ASHA process not running at stream start")
+			return
+		
 		buffer = b""
 		last_stats: Optional[dict] = None
 		
 		buffer_x, buffer_y, buffer_z = [], [], []
 		
 		def safe_append(buf, val):
-			"""Always keeps buffer as a list even if corrupted."""
 			if not isinstance(buf, list):
 				buf = [buf] if isinstance(buf, (int, float)) else []
 			buf.append(val)
@@ -1269,7 +1338,6 @@ class BluetoothAshaManager:
 				diff = v - mean_val
 				total += diff * diff
 			var = total / n
-			# manual sqrt (Newton method)
 			x = var
 			if x <= 0.0:
 				return mean_val, 0.0
@@ -1339,6 +1407,15 @@ class BluetoothAshaManager:
 		
 		while not shutdown_evt.is_set():
 			try:
+				# Check if ASHA process is still alive
+				try:
+					os.kill(child_pid, 0)
+				except ProcessLookupError:
+					logger.warning("ASHA process died unexpectedly")
+					if self.args.reconnect:
+						reconnect_evt.set()
+					break
+				
 				rlist, _, _ = select.select([master_fd], [], [], 0.1)
 				if master_fd in rlist:
 					data = os.read(master_fd, 1024)
@@ -1503,10 +1580,7 @@ class BluetoothAshaManager:
 				break
 
 	def perform_gatt_operations(self, mac_address: str, device_name: str) -> bool:
-		"""
-		Perform GATT operations by connecting to the device, selecting the attribute,
-		and writing the volume. Uses device-specific volume if enabled.
-		"""
+		"""Perform GATT operations by connecting to the device"""
 		# Get device-specific volume or use default
 		volume_value = self.device_manager.get_device_volume(mac_address, self.volume_value)
 		
@@ -1536,9 +1610,7 @@ exit
 			return False
 
 	def monitor_device_changes(self) -> None:
-		"""
-		Periodically monitor the list of connected devices and trigger a reconnect if required.
-		"""
+		"""Periodically monitor the list of connected devices"""
 		while not shutdown_evt.is_set():
 			try:
 				# Get current connected devices from our tracking
@@ -1572,86 +1644,105 @@ exit
 				time.sleep(2)
 
 	def terminate_asha(self) -> None:
-		"""
-		Gracefully terminate the ASHA sink process.
-		"""
-		global asha_handle, asha_started
-		if asha_handle:
-			child_pid, master_fd = asha_handle
-			try:
-				pgid = os.getpgid(child_pid)
-				logger.info(f"Terminating ASHA process group {pgid}...")
-				os.killpg(pgid, signal.SIGTERM)
-				timeout = 5
-				end_time = time.time() + timeout
-				while True:
-					try:
-						res = os.waitpid(child_pid, os.WNOHANG)
-						if res != (0, 0):
-							logger.info(f"{Fore.GREEN}ASHA process terminated gracefully{Style.RESET_ALL}")
-							break
-					except ChildProcessError:
-						break
-					if time.time() > end_time:
-						logger.warning(f"{Fore.YELLOW}Timeout reached; forcing kill{Style.RESET_ALL}")
-						os.killpg(pgid, signal.SIGKILL)
-						break
-					time.sleep(0.1)
-			except Exception as e:
-				logger.error(f"Error terminating ASHA process: {e}")
-			finally:
+		"""Gracefully terminate the ASHA sink process with comprehensive cleanup"""
+		with global_lock:
+			if asha_handle:
+				child_pid, master_fd = asha_handle
+				logger.info(f"Terminating ASHA process (PID: {child_pid})...")
+				
 				try:
-					os.close(master_fd)
-				except Exception:
-					pass
-				asha_handle = None
-				asha_started = False
+					# Try graceful termination first
+					pgid = os.getpgid(child_pid)
+					os.killpg(pgid, signal.SIGTERM)
+					
+					# Wait for graceful shutdown
+					timeout = 5
+					end_time = time.time() + timeout
+					terminated = False
+					
+					while time.time() < end_time:
+						try:
+							# Check if process still exists
+							os.kill(child_pid, 0)
+							time.sleep(0.1)
+						except ProcessLookupError:
+							terminated = True
+							break
+					
+					if not terminated:
+						logger.warning("ASHA process did not terminate gracefully - forcing kill")
+						try:
+							os.killpg(pgid, signal.SIGKILL)
+							time.sleep(0.5)
+						except ProcessLookupError:
+							pass  # Process already gone
+							
+				except ProcessLookupError:
+					logger.info("ASHA process already terminated")
+				except Exception as e:
+					logger.error(f"Error during ASHA termination: {e}")
+					# Final attempt - kill any remaining ASHA processes
+					kill_existing_asha_processes()
+				finally:
+					try:
+						os.close(master_fd)
+					except Exception:
+						pass
+					asha_handle = None
+					asha_started = False
+					
+				logger.info(f"{Fore.GREEN}ASHA sink terminated{Style.RESET_ALL}")
+			else:
+				# If handle is None but processes might exist, clean them up
+				if is_asha_process_running():
+					logger.warning("Cleaning up orphaned ASHA processes")
+					kill_existing_asha_processes()
 
 	def cleanup(self) -> None:
-		"""
-		Cleanup routine for shutting down all components gracefully.
-		"""
+		"""Cleanup routine for shutting down all components gracefully"""
 		logger.info(f"{Fore.BLUE}Cleaning up...{Style.RESET_ALL}")
 		self.stop_advertising(self.args.disable_advertisement)
 		if self.args.disconnect:
 			run_command("bluetoothctl agent off", check=False)
 			run_command("bluetoothctl power off", check=False)
-		if asha_handle:
-			self.terminate_asha()
+		
+		with global_lock:
+			if asha_handle:
+				self.terminate_asha()
+		
 		run_command("bluetoothctl pairable off", check=False)
 		shutdown_evt.set()
+		async_manager.stop()
 		logger.info(f"{Fore.GREEN}Cleanup complete{Style.RESET_ALL}")
 
 	def signal_handler(self, sig, frame) -> None:
-		"""
-		Handle signals for graceful shutdown.
-		"""
+		"""Handle signals for graceful shutdown"""
 		logger.warning(f"Received signal {sig}, shutting down...")
 		self.cleanup()
 		sys.exit(0)
 
 	# Main loop
 	def run(self) -> None:
-		"""
-		Main loop to initialize Bluetooth, start scanning, monitor devices, and manage the ASHA sink.
-		UPDATED: Support PRIMARY_ONLY and SECONDARY_ONLY modes.
-		"""
+		"""Main loop to initialize Bluetooth, start scanning, monitor devices, and manage the ASHA sink"""
 		signal.signal(signal.SIGINT, self.signal_handler)
 		signal.signal(signal.SIGTERM, self.signal_handler)
 		signal.signal(signal.SIGHUP, self.signal_handler)
+		
+		# Start async event loop
+		async_manager.start()
+		
 		try:
 			self.initialize_bluetooth()
 			self.start_advertising(self.args.disable_advertisement)
 			self.start_continuous_scan()
 			threading.Thread(target=self.monitor_device_changes, daemon=True).start()
 
-			global asha_handle, asha_started
 			while not shutdown_evt.is_set():
 				# Get all matching devices
 				matching_devices = self.get_matching_devices()
 				
 				if matching_devices:
-					with processed_lock:
+					with global_lock:
 						current_macs = {mac for mac, _ in matching_devices}
 						new_macs = current_macs - processed_devices
 						for mac in new_macs:
@@ -1668,23 +1759,38 @@ exit
 								daemon=True
 							).start()
 
-				# Manage ASHA sink - UPDATED: Only start once when primary connects
-				# ASHA is now started immediately in handle_new_device when primary connects
-				# This ensures ASHA starts regardless of secondary connection status
-					
+				# Manage ASHA sink restart
 				if asha_restart_evt.is_set():
+					logger.info("ASHA restart triggered")
 					self.terminate_asha()
-					# Only restart ASHA if we have a primary device connected
-					# Skip in SECONDARY_ONLY mode
-					if (self.device_manager.is_primary_connected() and 
-						self.operation_mode != "secondary_only"):
-						asha_handle = self.start_asha()
-						asha_restart_evt.clear()
-						threading.Thread(
-							target=self.stream_asha_output,
-							args=(asha_handle,),
-							daemon=True
-						).start()
+					
+					# Wait a bit to ensure clean state
+					time.sleep(1)
+					
+					# Final check before restart
+					with global_lock:
+						if is_asha_process_running():
+							logger.error("ASHA processes still running after termination - skipping restart")
+							asha_restart_evt.clear()
+						else:
+							# Only restart if we have a primary device connected
+							# Skip in SECONDARY_ONLY mode
+							if (self.device_manager.is_primary_connected() and 
+								self.operation_mode != "secondary_only"):
+								try:
+									asha_handle = self.start_asha()
+									asha_restart_evt.clear()
+									threading.Thread(
+										target=self.stream_asha_output,
+										args=(asha_handle,),
+										daemon=True
+									).start()
+								except Exception as e:
+									logger.error(f"Failed to restart ASHA: {e}")
+									asha_restart_evt.clear()
+							else:
+								logger.info("No primary connected - skipping ASHA restart")
+								asha_restart_evt.clear()
 
 				if reset_evt.is_set():
 					logger.info("Controller resetting...")
@@ -1729,7 +1835,6 @@ def main() -> None:
 						help=f"Maximum number of devices to connect simultaneously (default: {MAX_DEVICES})")
 	parser.add_argument('-pp', '--priority-primary', action='store_true', default=None,
 						help="Prioritize primary devices over secondary (default: from config)")
-	# NEW: Add PRIMARY_ONLY and SECONDARY_ONLY arguments
 	parser.add_argument('-po','--primary-only', action='store_true',
 						help="Only connect to primary devices (overrides config and environment)")
 	parser.add_argument('-so','--secondary-only', action='store_true',
