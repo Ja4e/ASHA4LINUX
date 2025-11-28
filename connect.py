@@ -1069,6 +1069,7 @@ class BluetoothAshaManager:
 			# Start ASHA immediately when primary connects
 			if actual_device_type == "primary" and self.operation_mode != "secondary_only":
 				with global_lock:
+					global asha_handle, asha_started
 					if not asha_handle and not asha_started:
 						logger.info(f"{Fore.GREEN}Primary device connected - starting ASHA sink{Style.RESET_ALL}")
 						asha_handle = self.start_asha()
@@ -1646,6 +1647,7 @@ exit
 	def terminate_asha(self) -> None:
 		"""Gracefully terminate the ASHA sink process with comprehensive cleanup"""
 		with global_lock:
+			global asha_handle, asha_started
 			if asha_handle:
 				child_pid, master_fd = asha_handle
 				logger.info(f"Terminating ASHA process (PID: {child_pid})...")
@@ -1707,6 +1709,7 @@ exit
 			run_command("bluetoothctl power off", check=False)
 		
 		with global_lock:
+			global asha_handle
 			if asha_handle:
 				self.terminate_asha()
 		
@@ -1769,6 +1772,7 @@ exit
 					
 					# Final check before restart
 					with global_lock:
+						global asha_handle, asha_started
 						if is_asha_process_running():
 							logger.error("ASHA processes still running after termination - skipping restart")
 							asha_restart_evt.clear()
@@ -1779,6 +1783,7 @@ exit
 								self.operation_mode != "secondary_only"):
 								try:
 									asha_handle = self.start_asha()
+									asha_started = True
 									asha_restart_evt.clear()
 									threading.Thread(
 										target=self.stream_asha_output,
