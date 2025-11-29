@@ -133,7 +133,7 @@ logger = logging.getLogger(__name__)
 # ------------------------------
 # CONFIGURATION
 # ------------------------------
-config_path = "~/.config/asha_manager/config1.json"
+config_path = "~/.config/asha_manager/config.json"
 
 def load_config(config_path: str) -> dict:
 	"""
