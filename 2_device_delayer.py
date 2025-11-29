@@ -31,6 +31,11 @@ DEFAULT_CONFIG = {
 '''
 WARNING!
 DO NOT USE EASYEFFECT WITH THIS IT WILL BREAK
+
+
+also it ONLY STREAMS TO DOUBLE CHANNEL BY DEFAULT using with left or right automatically will not work properly for BT devices
+you can try use pwvucontrol software to control the channel
+You can run this in background
 '''
 
 
