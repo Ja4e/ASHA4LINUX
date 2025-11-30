@@ -209,9 +209,9 @@ class CombinedSink:
 				run_cmd(['pactl', 'set-sink-volume', self.name, volume])
 		return self.module_id
 
-	# def update_slaves(self, new_slaves):
-		# self.slaves = new_slaves
-		# run_cmd(['pactl', 'set-sink-slaves', self.name, ','.join(self.slaves)]) # append , check=False if necessary
+	def update_slaves(self, new_slaves):
+		self.slaves = new_slaves
+		run_cmd(['pactl', 'set-sink-slaves', self.name, ','.join(self.slaves), check=False]) # append , check=False if necessary
 
 	def cleanup(self):
 		if self.module_id:
@@ -361,13 +361,13 @@ class AudioManager:
 				except Exception as e:
 					logging.error(f"Failed to recreate loopback for {sink.name}: {e}")
 
-		# # If combined sink exists, ensure slaves list still correct
-		# if self.comb_sink.module_id:
-			# slaves = [self.sink1.name] + ([self.sink2.name] if self.sink2.loopback_id else [])
-			# try:
-				# self.comb_sink.update_slaves(slaves)
-			# except Exception as e:
-				# logging.warning(f"Failed to update combined sink slaves: {e}")
+		# If combined sink exists, ensure slaves list still correct
+		if self.comb_sink.module_id:
+			slaves = [self.sink1.name] + ([self.sink2.name] if self.sink2.loopback_id else [])
+			try:
+				self.comb_sink.update_slaves(slaves)
+			except Exception as e:
+				logging.warning(f"Failed to update combined sink slaves: {e}")
 
 	def run(self):
 		# Save original default sink
@@ -598,4 +598,3 @@ if __name__ == '__main__':
 			manager.stop_flag.set()
 			# give run() finalizer a chance to run
 			time.sleep(0.1)
-
