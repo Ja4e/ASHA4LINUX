@@ -229,16 +229,6 @@ def load_config(config_path: str) -> dict:
 				"MAX_TIMEOUT": "R",
 				"Timeout_qs": "R",
 			},
-			"Reconnection": {
-				"Secondary": {
-					"Enabled": True,
-					"Mode": "incremental",
-					"Initial_Delay": 5.0,
-					"Max_Delay": 60.0,
-					"Max_Attempts": 10,
-					"Backoff_Multiplier": 1.5
-				}
-			},
 			"Blacklist": [
 				"AudioStream Adapter DFU",
 			]
@@ -367,10 +357,6 @@ asha_started: bool = False
 # Connection state tracking (thread-safe by design)
 primary_connection_in_progress = threading.Event()
 secondary_connection_in_progress = threading.Event()
-
-# Secondary reconnection tracking (protected by global_lock)
-secondary_reconnection_attempts: Dict[str, Dict] = {}
-logged_secondary_no_primary: Set[str] = set()
 
 # ------------------------------
 # ASYNC EVENT LOOP MANAGEMENT
@@ -573,19 +559,9 @@ class DeviceManager:
 				
 		return "unknown"
 	
-	def get_device_priority(self, device_type: str) -> int:
-		"""Get priority level for device type (lower number = higher priority)"""
-		if device_type == "primary":
-			return 1
-		elif device_type == "secondary":
-			return 2
-		else:
-			return 3
-	
 	def add_connected_device(self, mac: str, name: str) -> None:
 		"""Add device to connected devices list with type detection"""
 		device_type = self.get_device_type(name)
-		priority = self.get_device_priority(device_type)
 		
 		with global_lock:
 			connected_devices[mac] = {
@@ -593,21 +569,13 @@ class DeviceManager:
 				'volume': config["GATT"]["Volume"]["Value"],
 				'last_seen': time.time(),
 				'device_type': device_type,
-				'priority': priority
 			}
 		
 		# Clear connection in progress flags when connection succeeds
 		if device_type == "primary":
 			primary_connection_in_progress.clear()
-			self.clear_skipped_secondary_devices()
 		elif device_type == "secondary":
 			secondary_connection_in_progress.clear()
-			
-		# Clear reconnection tracking when device connects successfully
-		if device_type == "secondary":
-			with global_lock:
-				if mac in secondary_reconnection_attempts:
-					del secondary_reconnection_attempts[mac]
 	
 	def remove_connected_device(self, mac: str) -> None:
 		"""Remove device from connected devices list"""
@@ -627,13 +595,6 @@ class DeviceManager:
 		"""Get list of connected devices as (mac, name, type) tuples"""
 		with global_lock:
 			return [(mac, data['name'], data['device_type']) for mac, data in connected_devices.items()]
-	
-	def get_connected_devices_by_priority(self) -> List[Tuple[str, str, str, int]]:
-		"""Get connected devices sorted by priority"""
-		with global_lock:
-			devices = [(mac, data['name'], data['device_type'], data['priority']) 
-					  for mac, data in connected_devices.items()]
-			return sorted(devices, key=lambda x: x[3])
 	
 	def update_device_seen(self, mac: str) -> None:
 		"""Update last seen timestamp for device"""
@@ -661,7 +622,7 @@ class DeviceManager:
 	
 	def should_connect_device(self, device_type: str, mode_override: Optional[str] = None) -> bool:
 		"""
-		Determine if we should connect a new device based on type and connection rules.
+		Simple connection logic
 		"""
 		if not self.can_connect_more():
 			return False
@@ -672,25 +633,11 @@ class DeviceManager:
 		elif mode_override == "secondary_only" and device_type != "secondary":
 			return False
 			
+		# Simply check if we're not already connecting to this device type
 		if device_type == "primary":
-			# Only connect primary if no other primary is connected AND no secondary connection is in progress
-			return (not self.is_primary_connected() and 
-				   not primary_connection_in_progress.is_set() and
-				   not secondary_connection_in_progress.is_set())
-			
+			return not primary_connection_in_progress.is_set()
 		elif device_type == "secondary":
-			# Only connect secondary if we have a primary connected AND no secondary is connected
-			# AND no primary connection is in progress
-			# UNLESS we're in secondary_only mode, then connect regardless of primary
-			if mode_override == "secondary_only":
-				return (not self.is_secondary_connected() and
-					   not primary_connection_in_progress.is_set() and
-					   not secondary_connection_in_progress.is_set())
-			else:
-				return (self.is_primary_connected() and 
-					   not self.is_secondary_connected() and
-					   not primary_connection_in_progress.is_set() and
-					   not secondary_connection_in_progress.is_set())
+			return not secondary_connection_in_progress.is_set()
 			
 		return False
 
@@ -710,17 +657,6 @@ class DeviceManager:
 		
 		status_str = ", ".join(status_parts)
 		return f"{status_str} ({total_count}/{MAX_DEVICES} total)"
-	
-	def clear_skipped_secondary_devices(self) -> None:
-		"""Clear skipped status for secondary devices when primary connects"""
-		with global_lock:
-			secondary_skip_keys = [key for key in processed_devices if "secondary" in key]
-			for key in secondary_skip_keys:
-				processed_devices.discard(key)
-			
-			logged_secondary_no_primary.clear()
-			
-			log_debug(f"Cleared {len(secondary_skip_keys)} skipped secondary devices")
 
 # Initialize device manager
 device_manager = DeviceManager()
@@ -1064,7 +1000,7 @@ class BluetoothAshaManager:
 		return False
 
 	def handle_new_device(self, mac: str, name: str) -> None:
-		"""Process a newly discovered device"""
+		""" Process a newly discovered device """
 		if any(black in name for black in BLACKLIST):
 			log_info(f"Device {name} ({mac}) is blacklisted. Skipping connection.")
 			return
@@ -1078,33 +1014,9 @@ class BluetoothAshaManager:
 		# Determine device type
 		device_type = self.device_manager.get_device_type(name)
 
+		# Check if we should connect based on simple rules
 		if not self.device_manager.should_connect_device(device_type, self.operation_mode):
-			with global_lock:
-				skip_key = f"{mac}_{device_type}_{self.operation_mode}"
-				
-				if skip_key in processed_devices:
-					return
-				processed_devices.add(skip_key)
-			
-			if self.operation_mode == "primary_only" and device_type == "secondary":
-				log_debug(f"Skipping secondary device {name} - PRIMARY ONLY mode")
-			elif self.operation_mode == "secondary_only" and device_type == "primary":
-				log_debug(f"Skipping primary device {name} - SECONDARY ONLY mode")
-			elif device_type == "primary" and self.device_manager.is_primary_connected():
-				log_debug(f"Skipping primary device {name} - primary already connected")
-			elif device_type == "primary" and (primary_connection_in_progress.is_set() or secondary_connection_in_progress.is_set()):
-				log_debug(f"Skipping primary device {name} - connection in progress")
-			elif device_type == "secondary" and self.device_manager.is_secondary_connected():
-				log_debug(f"Skipping secondary device {name} - secondary already connected")
-			elif device_type == "secondary" and not self.device_manager.is_primary_connected() and self.operation_mode != "secondary_only":
-				log_debug(f"Skipping secondary device {name} - waiting for primary connection")
-				with global_lock:
-					logged_secondary_no_primary.add(mac)
-			elif device_type == "secondary" and (primary_connection_in_progress.is_set() or secondary_connection_in_progress.is_set()):
-				log_debug(f"Skipping secondary device {name} - connection in progress")
-			else:
-				log_debug(f"Skipping {device_type} device {name} - connection limit reached")
-			
+			log_debug(f"Skipping {device_type} device {name} - connection limit or mode restriction")
 			return
 
 		# Check if we can connect more devices (general limit)
@@ -1161,14 +1073,6 @@ class BluetoothAshaManager:
 							args=(asha_handle,),
 							daemon=True
 						).start()
-						
-						# Start secondary reconnection worker when primary connects
-						if (SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES and 
-							self.operation_mode != "primary_only"):
-							self.start_secondary_reconnection_worker()
-				
-				log_info("Primary connected - attempting to connect secondary devices...", Fore.YELLOW)
-				self.attempt_secondary_connections()
 			
 			# Log connection summary
 			status_summary = self.device_manager.get_connection_status_summary()
@@ -1177,7 +1081,6 @@ class BluetoothAshaManager:
 			run_trust_background(mac)
 			disable_pairable_background()
 			run_command("bluetoothctl discoverable off")
-			run_command("bluetoothctl scan off") # I certainly hoped bluetoothctl can close it immediately
 		else:
 			# Only trigger reset for primary device failures, not secondary
 			if device_type == "primary" and self.args.reset_on_failure:
@@ -1185,10 +1088,6 @@ class BluetoothAshaManager:
 				reset_evt.set()
 				self.cleanup()
 				os.execv(sys.executable, [sys.executable] + sys.argv)
-			elif device_type == "secondary":
-				# For secondary failures, track for reconnection and allow retry later
-				log_warning(f"Failed to connect to secondary device {name}, will retry later")
-				self.track_secondary_reconnection(mac, name)
 			else:
 				log_warning(f"Failed to connect to {device_type} device {name}")
 				
@@ -1234,149 +1133,6 @@ exit
 				
 		except Exception as e:
 			log_error(f"Error executing secondary GATT operations for {name}: {e}")
-
-	def attempt_secondary_connections(self) -> None:
-		"""Immediately attempt to connect any available secondary devices after primary connects"""
-		if self.operation_mode == "primary_only":
-			return
-			
-		log_debug("Scanning for available secondary devices to connect...")
-		
-		# Get all matching devices
-		matching_devices = self.get_matching_devices()
-		
-		for mac, name in matching_devices:
-			device_type = self.device_manager.get_device_type(name)
-			
-			if device_type == "secondary" and not self.device_manager.is_device_connected(mac):
-				skip_key = f"{mac}_{device_type}_{self.operation_mode}"
-				was_skipped = skip_key in processed_devices
-				
-				if was_skipped:
-					log_debug(f"Re-trying previously skipped secondary device: {name}")
-					with global_lock:
-						processed_devices.discard(skip_key)
-						processed_devices.discard(mac)
-				
-				if self.device_manager.should_connect_device(device_type, self.operation_mode):
-					log_device(f"Attempting immediate connection to: {name}", "secondary")
-					threading.Thread(
-						target=self.handle_new_device,
-						args=(mac, name),
-						daemon=True
-					).start()
-					time.sleep(0.5)
-
-	def track_secondary_reconnection(self, mac: str, name: str) -> None:
-		"""Track secondary device for reconnection attempts using config values"""
-		if not SECONDARY_RECONNECTION_ENABLED or self.operation_mode == "primary_only":
-			return
-			
-		with global_lock:
-			if mac not in secondary_reconnection_attempts:
-				secondary_reconnection_attempts[mac] = {
-					'name': name,
-					'attempts': 0,
-					'next_attempt_time': time.time() + SECONDARY_INITIAL_DELAY,
-					'current_delay': SECONDARY_INITIAL_DELAY,
-					'max_attempts': SECONDARY_MAX_ATTEMPTS,
-					'max_delay': SECONDARY_MAX_DELAY,
-					'backoff_multiplier': SECONDARY_BACKOFF_MULTIPLIER,
-					'mode': SECONDARY_RECONNECTION_MODE
-				}
-				log_info(f"Started tracking secondary device {name} for reconnection (max attempts: {SECONDARY_MAX_ATTEMPTS})")
-			else:
-				# Update existing tracking
-				tracking = secondary_reconnection_attempts[mac]
-				tracking['attempts'] += 1
-				
-				# Check if we've reached max attempts
-				if tracking['attempts'] >= tracking['max_attempts']:
-					log_warning(f"Max reconnection attempts ({tracking['max_attempts']}) reached for secondary device {name}. Giving up.")
-					del secondary_reconnection_attempts[mac]
-					return
-				
-				# Calculate next delay based on mode
-				if tracking['mode'] == "incremental":
-					tracking['current_delay'] = min(
-						tracking['current_delay'] * tracking['backoff_multiplier'],
-						tracking['max_delay']
-					)
-				elif tracking['mode'] == "exponential":
-					tracking['current_delay'] = min(
-						SECONDARY_INITIAL_DELAY * (tracking['backoff_multiplier'] ** tracking['attempts']),
-						tracking['max_delay']
-					)
-				else:  # periodic
-					tracking['current_delay'] = SECONDARY_INITIAL_DELAY
-					
-				tracking['next_attempt_time'] = time.time() + tracking['current_delay']
-				
-				log_info(f"Scheduled reconnection to {name} in {tracking['current_delay']:.1f}s (attempt {tracking['attempts'] + 1}/{tracking['max_attempts']})")
-
-	def start_secondary_reconnection_worker(self) -> None:
-		"""Event-based secondary reconnection worker using config values"""
-		if self.operation_mode == "primary_only" or not SECONDARY_RECONNECTION_ENABLED:
-			return
-			
-		def reconnection_worker():
-			log_info(f"Starting secondary reconnection worker - Mode: {SECONDARY_RECONNECTION_MODE}, "
-				   f"Initial Delay: {SECONDARY_INITIAL_DELAY}s, Max Delay: {SECONDARY_MAX_DELAY}s, "
-				   f"Max Attempts: {SECONDARY_MAX_ATTEMPTS}, Backoff: {SECONDARY_BACKOFF_MULTIPLIER}x")
-			
-			while not shutdown_evt.is_set():
-				try:
-					# Only run if primary is connected and we have secondary devices to reconnect
-					# In SECONDARY_ONLY mode, we don't need primary to be connected
-					if ((self.operation_mode == "secondary_only" or self.device_manager.is_primary_connected()) and 
-						not self.device_manager.is_secondary_connected()):
-						
-						current_time = time.time()
-						devices_to_reconnect = []
-						
-						# Find devices ready for reconnection
-						with global_lock:
-							for mac, tracking in list(secondary_reconnection_attempts.items()):
-								if (current_time >= tracking['next_attempt_time'] and 
-									tracking['attempts'] < tracking['max_attempts']):
-									devices_to_reconnect.append((mac, tracking['name'], tracking))
-						
-						# Attempt reconnection for ready devices
-						for mac, name, tracking in devices_to_reconnect:
-							if not self.device_manager.can_connect_more():
-								break
-								
-							# Check if we're already trying to process this device
-							with global_lock:
-								if mac in processed_devices:
-									continue
-								processed_devices.add(mac)
-							
-							log_info(f"Attempting reconnection to secondary: {name} (attempt {tracking['attempts'] + 1}/{tracking['max_attempts']})")
-							threading.Thread(
-								target=self.handle_new_device,
-								args=(mac, name),
-								daemon=True
-							).start()
-							
-							# Small delay between reconnection attempts
-							time.sleep(1)
-					
-					# Check more frequently when we have pending reconnections
-					with global_lock:
-						has_pending = bool(secondary_reconnection_attempts)
-					
-					if has_pending:
-						time.sleep(2)
-					else:
-						time.sleep(5)
-						
-				except Exception as e:
-					log_error(f"Secondary reconnection worker error: {e}")
-					time.sleep(10)
-
-		# Start the worker thread
-		threading.Thread(target=reconnection_worker, daemon=True).start()
 
 	# ASHA Sink Management
 	def start_asha(self) -> Tuple[int, int]:
@@ -2036,3 +1792,4 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
+
