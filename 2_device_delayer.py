@@ -467,6 +467,9 @@ args = parser.parse_args()
 DEFAULT_CONFIG['LAT1'] = args.lat1
 DEFAULT_CONFIG['LAT2'] = args.lat2
 
+# Global reference for GTK UI cleanup
+gtk_window = None
+
 # === GTK UI ===
 def run_gtk_ui(manager: AudioManager):
 	# Import GTK only when needed to avoid hard dependency in non-ui mode
@@ -553,12 +556,25 @@ def run_gtk_ui(manager: AudioManager):
 			d.destroy()
 
 	# Create and show window
+	global gtk_window
 	win = LatencyWindow()
+	gtk_window = win  # Store reference for cleanup
+	
 	# Do NOT set a route that triggers manager.stop_flag on destroy.
 	win.connect("destroy", lambda w: Gtk.main_quit())
 	win.show_all()
 	# This blocks the main thread until UI closed; after that, control returns to caller
 	Gtk.main()
+
+def close_gtk_ui():
+	"""Close GTK UI from outside (e.g., on KeyboardInterrupt)"""
+	global gtk_window
+	if gtk_window:
+		try:
+			gtk_window.destroy()
+		except Exception as e:
+			logging.debug(f"Error closing GTK window: {e}")
+		gtk_window = None
 
 # === ENTRY POINT ===
 if __name__ == '__main__':
@@ -577,8 +593,10 @@ if __name__ == '__main__':
 		try:
 			run_gtk_ui(manager)
 		except KeyboardInterrupt:
-			# if user pressed Ctrl-C while GTK running
-			pass
+			# if user pressed Ctrl-C while GTK running, close the UI
+			close_gtk_ui()
+			# Also signal manager to stop
+			manager.stop_flag.set()
 
 		# After the GTK UI closes, keep the manager running until the user Ctrl-C the whole process.
 		# This reproduces the original behavior: UI is only a control surface, manager runs until explicit exit.
@@ -598,3 +616,4 @@ if __name__ == '__main__':
 			manager.stop_flag.set()
 			# give run() finalizer a chance to run
 			time.sleep(0.1)
+
