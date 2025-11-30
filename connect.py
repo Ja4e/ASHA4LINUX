@@ -183,6 +183,10 @@ def log_gatt(message: str) -> None:
 	"""Consistent GATT operation logging"""
 	logger.info(f"{Fore.CYAN}[GATT] {message}{Style.RESET_ALL}")
 
+def log_reconnection(message: str) -> None:
+	"""Consistent reconnection logging"""
+	logger.info(f"{Fore.MAGENTA}[RECONN] {message}{Style.RESET_ALL}")
+
 # ------------------------------
 # CONFIGURATION
 # ------------------------------
@@ -228,6 +232,16 @@ def load_config(config_path: str) -> dict:
 				"DEFAULT_RETRY": 0.0,
 				"MAX_TIMEOUT": "R",
 				"Timeout_qs": "R",
+			},
+			"Reconnection": {
+				"Secondary": {
+					"Enabled": True,
+					"Mode": "incremental",
+					"Initial_Delay": 5.0,
+					"Max_Delay": 60.0,
+					"Max_Attempts": 10,
+					"Backoff_Multiplier": 1.5
+				}
 			},
 			"Blacklist": [
 				"AudioStream Adapter DFU",
@@ -354,9 +368,12 @@ asha_restart_evt = threading.Event()
 asha_handle: Optional[Tuple[int, int]] = None
 asha_started: bool = False
 
-# Connection state tracking (thread-safe by design)
+# Legacy-style connection tracking (simpler approach)
 primary_connection_in_progress = threading.Event()
 secondary_connection_in_progress = threading.Event()
+
+# NEW: Secondary device reconnection tracking
+secondary_reconnection_attempts: Dict[str, Dict[str, Any]] = {}  # mac -> {attempts: int, next_delay: float, last_attempt: float}
 
 # ------------------------------
 # ASYNC EVENT LOOP MANAGEMENT
@@ -517,6 +534,228 @@ def disable_pairable_background() -> None:
 		log_warning(f"Failed to run bluetoothctl pairable off: {e}")
 
 # ------------------------------
+# SECONDARY DEVICE RECONNECTION MANAGER
+# ------------------------------
+class SecondaryReconnectionManager:
+	"""Manages reconnection attempts for secondary devices without restarting Bluetooth"""
+	
+	def __init__(self):
+		self.reconnection_threads: Dict[str, threading.Thread] = {}
+		self.reconnection_events: Dict[str, threading.Event] = {}
+		
+	def should_attempt_reconnection(self, mac: str, name: str, enabled: bool) -> bool:
+		"""Check if we should attempt reconnection for this secondary device"""
+		if not enabled:
+			log_reconnection(f"Secondary reconnection disabled, skipping {name}")
+			return False
+			
+		with global_lock:
+			if mac in secondary_reconnection_attempts:
+				attempt_info = secondary_reconnection_attempts[mac]
+				if attempt_info['attempts'] >= SECONDARY_MAX_ATTEMPTS:
+					log_reconnection(f"Max reconnection attempts ({SECONDARY_MAX_ATTEMPTS}) reached for {name}, giving up")
+					return False
+					
+				# Check if enough time has passed since last attempt
+				time_since_last = time.time() - attempt_info['last_attempt']
+				if time_since_last < attempt_info['next_delay']:
+					return False
+			else:
+				# First attempt
+				secondary_reconnection_attempts[mac] = {
+					'attempts': 0,
+					'next_delay': SECONDARY_INITIAL_DELAY,
+					'last_attempt': 0
+				}
+				
+		return True
+	
+	def update_reconnection_attempt(self, mac: str, success: bool) -> None:
+		"""Update reconnection attempt counter and calculate next delay"""
+		with global_lock:
+			if mac not in secondary_reconnection_attempts:
+				return
+				
+			if success:
+				# Reset on successful reconnection
+				del secondary_reconnection_attempts[mac]
+				if mac in self.reconnection_events:
+					self.reconnection_events[mac].set()  # Stop reconnection thread
+			else:
+				attempt_info = secondary_reconnection_attempts[mac]
+				attempt_info['attempts'] += 1
+				attempt_info['last_attempt'] = time.time()
+				
+				# Calculate next delay based on mode
+				if SECONDARY_RECONNECTION_MODE == "incremental":
+					next_delay = attempt_info['next_delay'] * SECONDARY_BACKOFF_MULTIPLIER
+					attempt_info['next_delay'] = min(next_delay, SECONDARY_MAX_DELAY)
+				elif SECONDARY_RECONNECTION_MODE == "constant":
+					attempt_info['next_delay'] = SECONDARY_INITIAL_DELAY
+				else:  # exponential
+					next_delay = SECONDARY_INITIAL_DELAY * (SECONDARY_BACKOFF_MULTIPLIER ** attempt_info['attempts'])
+					attempt_info['next_delay'] = min(next_delay, SECONDARY_MAX_DELAY)
+	
+	def start_reconnection_attempt(self, mac: str, name: str, device_manager, enabled: bool) -> None:
+		"""Start a reconnection attempt for a secondary device"""
+		if not self.should_attempt_reconnection(mac, name, enabled):
+			return
+			
+		# Stop any existing reconnection thread for this device
+		if mac in self.reconnection_events:
+			self.reconnection_events[mac].set()
+			
+		# Create new event for this reconnection attempt
+		stop_event = threading.Event()
+		self.reconnection_events[mac] = stop_event
+		
+		# Start reconnection thread
+		thread = threading.Thread(
+			target=self._reconnection_worker,
+			args=(mac, name, device_manager, stop_event, enabled),
+			daemon=True
+		)
+		self.reconnection_threads[mac] = thread
+		thread.start()
+		
+		log_reconnection(f"Started reconnection attempt for {name} (MAC: {mac})")
+	
+	def _reconnection_worker(self, mac: str, name: str, device_manager, stop_event: threading.Event, enabled: bool) -> None:
+		"""Worker thread for reconnecting to a secondary device"""
+		attempt_info = secondary_reconnection_attempts.get(mac, {})
+		attempt_count = attempt_info.get('attempts', 0) + 1
+		next_delay = attempt_info.get('next_delay', SECONDARY_INITIAL_DELAY)
+		
+		log_reconnection(f"Reconnection attempt {attempt_count}/{SECONDARY_MAX_ATTEMPTS} for {name} in {next_delay:.1f}s")
+		
+		# Wait for the calculated delay
+		if stop_event.wait(next_delay):
+			log_reconnection(f"Reconnection attempt for {name} cancelled")
+			return
+			
+		if shutdown_evt.is_set():
+			return
+			
+		# Attempt reconnection
+		log_reconnection(f"Attempting to reconnect to {name} (attempt {attempt_count})")
+		
+		try:
+			# Use the same connection logic as initial connection
+			future = async_manager.run_coroutine_threadsafe(
+				self._async_reconnect_attempt(mac, name, device_manager)
+			)
+			success = future.result(timeout=MAX_TIMEOUT + 10)
+		except Exception as e:
+			log_error(f"Async reconnection failed for {name}: {e}")
+			success = False
+		
+		# Update reconnection attempt counter
+		self.update_reconnection_attempt(mac, success)
+		
+		if success:
+			log_reconnection(f"Successfully reconnected to {name}")
+			device_manager.add_connected_device(mac, name)
+			
+			# Execute GATT operations for the reconnected device
+			log_gatt(f"Executing GATT operations for reconnected secondary device {name}")
+			time.sleep(1)
+			self._execute_secondary_gatt_operations(mac, name)
+		else:
+			log_warning(f"Reconnection attempt {attempt_count} failed for {name}")
+			
+			# Schedule next attempt if we haven't reached max attempts and feature is still enabled
+			if self.should_attempt_reconnection(mac, name, enabled):
+				log_reconnection(f"Scheduling next reconnection attempt for {name} in {secondary_reconnection_attempts[mac]['next_delay']:.1f}s")
+				self.start_reconnection_attempt(mac, name, device_manager, enabled)
+	
+	async def _async_reconnect_attempt(self, mac: str, name: str, device_manager) -> bool:
+		"""Asynchronous reconnection attempt for secondary device"""
+		if not re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac):
+			log_debug(f"Invalid MAC address in reconnection attempt: {mac}")
+			return False
+
+		attempts = 0
+		while not shutdown_evt.is_set() and attempts < 2:
+			try:
+				output = await asyncio.to_thread(
+					run_command,
+					f"bluetoothctl connect {mac}",
+					capture_output=True
+				)
+
+				if output and any(s in output for s in ["Connection successful", "already connected"]):
+					time.sleep(1)
+					info = await asyncio.to_thread(
+						run_command,
+						f"bluetoothctl info {mac}",
+						capture_output=True
+					)
+					if info and "Connected: yes" in info:
+						return True
+
+				log_warning(f"Reconnect attempt {attempts + 1} failed for secondary device {name}")
+
+			except Exception as e:
+				log_error(f"Reconnection attempt exception for {name}: {e}")
+
+			attempts += 1
+			await asyncio.sleep(DEFAULT_RETRY_INTERVAL)
+
+		return False
+	
+	def _execute_secondary_gatt_operations(self, mac: str, name: str) -> None:
+		"""Execute GATT operations for reconnected secondary device"""
+		try:
+			log_gatt(f"Executing bluetoothctl connect for reconnected secondary device {name}")
+			
+			connect_output = run_command(f"bluetoothctl connect {mac}", capture_output=True)
+			if connect_output and "Connection successful" in connect_output:
+				time.sleep(0.5)
+				
+				log_gatt(f"Executing GATT operations for reconnected secondary device {name}")
+				
+				process = subprocess.Popen(
+					["bluetoothctl"],
+					stdin=subprocess.PIPE,
+					stdout=subprocess.PIPE,
+					stderr=subprocess.PIPE,
+					text=True
+				)
+				
+				volume_value = config["GATT"]["Volume_Sec"]["Value"]
+				commands = f"""connect {mac}
+gatt.select-attribute {GATT_ATTRIBUTE_SEC}
+gatt.write {volume_value}
+exit
+"""
+				stdout, stderr = process.communicate(commands)
+				if process.returncode == 0:
+					log_gatt(f"Secondary GATT operations completed for reconnected {name}")
+				else:
+					log_error(f"Secondary GATT operations failed for reconnected {name}: {stderr.strip()}")
+			else:
+				log_warning(f"Failed to connect to reconnected secondary device {name} via bluetoothctl")
+				
+		except Exception as e:
+			log_error(f"Error executing secondary GATT operations for reconnected {name}: {e}")
+	
+	def stop_all_reconnections(self) -> None:
+		"""Stop all ongoing reconnection attempts"""
+		for mac, event in self.reconnection_events.items():
+			event.set()
+		
+		for mac, thread in self.reconnection_threads.items():
+			if thread.is_alive():
+				thread.join(timeout=2.0)
+		
+		self.reconnection_threads.clear()
+		self.reconnection_events.clear()
+		log_reconnection("All secondary reconnection attempts stopped")
+
+# Initialize secondary reconnection manager
+secondary_reconnection_manager = SecondaryReconnectionManager()
+
+# ------------------------------
 # DEVICE MANAGEMENT CLASS
 # ------------------------------
 class DeviceManager:
@@ -576,13 +815,22 @@ class DeviceManager:
 			primary_connection_in_progress.clear()
 		elif device_type == "secondary":
 			secondary_connection_in_progress.clear()
+			
+		# Clear any reconnection attempts for this device
+		if device_type == "secondary" and mac in secondary_reconnection_attempts:
+			with global_lock:
+				if mac in secondary_reconnection_attempts:
+					del secondary_reconnection_attempts[mac]
 	
-	def remove_connected_device(self, mac: str) -> None:
+	def remove_connected_device(self, mac: str, secondary_reconnect_enabled: bool = True) -> None:
 		"""Remove device from connected devices list"""
 		device_type = None
+		device_name = None
+		
 		with global_lock:
 			if mac in connected_devices:
 				device_type = connected_devices[mac]['device_type']
+				device_name = connected_devices[mac]['name']
 				del connected_devices[mac]
 		
 		# Clear connection flags when device is removed
@@ -590,6 +838,12 @@ class DeviceManager:
 			primary_connection_in_progress.clear()
 		elif device_type == "secondary":
 			secondary_connection_in_progress.clear()
+			
+			# Start reconnection attempt for secondary device if enabled
+			if (secondary_reconnect_enabled and device_name and 
+				not shutdown_evt.is_set() and self.can_connect_more()):
+				log_reconnection(f"Secondary device {device_name} disconnected, starting reconnection process")
+				secondary_reconnection_manager.start_reconnection_attempt(mac, device_name, self, secondary_reconnect_enabled)
 	
 	def get_connected_devices_info(self) -> List[Tuple[str, str, str]]:
 		"""Get list of connected devices as (mac, name, type) tuples"""
@@ -622,7 +876,8 @@ class DeviceManager:
 	
 	def should_connect_device(self, device_type: str, mode_override: Optional[str] = None) -> bool:
 		"""
-		Simple connection logic
+		LEGACY-STYLE: Simple connection logic - instantly connect to any matching device
+		unless we're at the device limit or the device type is excluded by mode.
 		"""
 		if not self.can_connect_more():
 			return False
@@ -633,7 +888,7 @@ class DeviceManager:
 		elif mode_override == "secondary_only" and device_type != "secondary":
 			return False
 			
-		# Simply check if we're not already connecting to this device type
+		# LEGACY LOGIC: Simply check if we're not already connecting to this device type
 		if device_type == "primary":
 			return not primary_connection_in_progress.is_set()
 		elif device_type == "secondary":
@@ -710,6 +965,15 @@ class BluetoothAshaManager:
 		self.timer: bool = False
 		self.ad_registered: bool = False
 		self.device_manager = device_manager
+		
+		# Determine secondary reconnection setting
+		# Command line argument overrides config setting
+		if hasattr(args, 'secondary_reconnect') and args.secondary_reconnect is not None:
+			self.secondary_reconnect_enabled = args.secondary_reconnect
+			log_info(f"Secondary reconnection {'enabled' if self.secondary_reconnect_enabled else 'disabled'} via command line", Fore.YELLOW)
+		else:
+			self.secondary_reconnect_enabled = SECONDARY_RECONNECTION_ENABLED
+			log_info(f"Secondary reconnection {'enabled' if self.secondary_reconnect_enabled else 'disabled'} via config")
 		
 		# Set volume value based on arguments and environment variable
 		env_volume = os.getenv("LND")
@@ -1000,7 +1264,7 @@ class BluetoothAshaManager:
 		return False
 
 	def handle_new_device(self, mac: str, name: str) -> None:
-		""" Process a newly discovered device """
+		"""LEGACY-STYLE: Process a newly discovered device - instantly connect to any matching device"""
 		if any(black in name for black in BLACKLIST):
 			log_info(f"Device {name} ({mac}) is blacklisted. Skipping connection.")
 			return
@@ -1014,7 +1278,7 @@ class BluetoothAshaManager:
 		# Determine device type
 		device_type = self.device_manager.get_device_type(name)
 
-		# Check if we should connect based on simple rules
+		# LEGACY LOGIC: Check if we should connect based on simple rules
 		if not self.device_manager.should_connect_device(device_type, self.operation_mode):
 			log_debug(f"Skipping {device_type} device {name} - connection limit or mode restriction")
 			return
@@ -1411,7 +1675,7 @@ exit
 											# Remove all connected devices on ASHA failure
 											connected_devices_info = self.device_manager.get_connected_devices_info()
 											for mac, name, _ in connected_devices_info:
-												self.device_manager.remove_connected_device(mac)
+												self.device_manager.remove_connected_device(mac, self.secondary_reconnect_enabled)
 											reconnect_evt.set()
 											asha_restart_evt.set()
 								
@@ -1436,7 +1700,7 @@ exit
 								# Remove all connected devices on ASHA failure
 								connected_devices_info = self.device_manager.get_connected_devices_info()
 								for mac, name, _ in connected_devices_info:
-									self.device_manager.remove_connected_device(mac)
+									self.device_manager.remove_connected_device(mac, self.secondary_reconnect_enabled)
 								reconnect_evt.set()
 								asha_restart_evt.set()
 							return
@@ -1456,7 +1720,7 @@ exit
 							if self.args.reconnect:
 								connected_devices_info = self.device_manager.get_connected_devices_info()
 								for mac, name, _ in connected_devices_info:
-									self.device_manager.remove_connected_device(mac)
+									self.device_manager.remove_connected_device(mac, self.secondary_reconnect_enabled)
 								reconnect_evt.set()
 								asha_restart_evt.set()
 							return
@@ -1565,12 +1829,20 @@ exit
 				if missing:
 					log_warning(f"Missing connections: {', '.join(missing)}")
 					for mac in missing:
-						self.device_manager.remove_connected_device(mac)
+						self.device_manager.remove_connected_device(mac, self.secondary_reconnect_enabled)
 					
 					# Use the new summary method
 					status_summary = self.device_manager.get_connection_status_summary()
 					log_connection(f"Remaining: {status_summary}", "warning")
-					reconnect_evt.set()
+					
+					# Only trigger full reconnect for primary devices, not secondary
+					# Secondary devices are handled by the reconnection manager
+					has_primary_missing = any(
+						connected_devices.get(mac, {}).get('device_type') == 'primary' 
+						for mac in missing
+					)
+					if has_primary_missing:
+						reconnect_evt.set()
 					
 				time.sleep(0.2)
 			except Exception as e:
@@ -1637,6 +1909,10 @@ exit
 		"""Cleanup routine for shutting down all components gracefully"""
 		log_info("Cleaning up...", Fore.BLUE)
 		self.stop_advertising(self.args.disable_advertisement)
+		
+		# Stop all secondary reconnection attempts
+		secondary_reconnection_manager.stop_all_reconnections()
+		
 		if self.args.disconnect:
 			run_command("bluetoothctl agent off", check=False)
 			run_command("bluetoothctl power off", check=False)
@@ -1777,6 +2053,13 @@ def main() -> None:
 						help="Only connect to primary devices (overrides config and environment(PRI_O))")
 	parser.add_argument('-so','--secondary-only', action='store_true',
 						help="Only connect to secondary devices (overrides config and environment(SEC_O))")
+	
+	# NEW: Secondary reconnection argument
+	parser.add_argument('-sr', '--secondary-reconnect', action='store_true', default=None,
+						help='Enable background reconnection for secondary devices without restarting Bluetooth (overrides config)')
+	parser.add_argument('-nsr', '--no-secondary-reconnect', action='store_false', dest='secondary_reconnect',
+						help='Disable background reconnection for secondary devices (overrides config)')
+	
 	args = parser.parse_args()
 
 	if args.max_devices is not None:
