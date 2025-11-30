@@ -211,7 +211,7 @@ class CombinedSink:
 
 	def update_slaves(self, new_slaves):
 		self.slaves = new_slaves
-		run_cmd(['pactl', 'set-sink-slaves', self.name, ','.join(self.slaves), check=False]) # append , check=False if necessary
+		run_cmd(['pactl', 'set-sink-slaves', self.name, ','.join(self.slaves)], check=False) # append , check=False if necessary
 
 	def cleanup(self):
 		if self.module_id:
