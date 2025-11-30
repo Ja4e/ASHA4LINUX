@@ -1147,7 +1147,7 @@ class BluetoothAshaManager:
 			logger.info(f"{Fore.CYAN}Executing bluetoothctl connect for secondary device {name} to ensure GATT execution{Style.RESET_ALL}")
 			
 			# First, ensure the device is connected via bluetoothctl
-			# connect_output = run_command(f"bluetoothctl connect {mac}", capture_output=True)
+			connect_output = run_command(f"bluetoothctl connect {mac}", capture_output=True)
 			if connect_output and "Connection successful" in connect_output:
 				# logger.info(f"{Fore.GREEN}Secondary device {name} connected via bluetoothctl{Style.RESET_ALL}")
 				
