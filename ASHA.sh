@@ -8,12 +8,19 @@ fi
 
 # Check if environment variables are set
 if [[ -z "${PRI_O}" && -z "${SEC_O}" ]]; then
-    # Neither PRI_O nor SEC_O is set, launch kitty split
-    kitty @ launch --location=hsplit --title delayer --cwd=current python ~/ASHA4LINUX/2_device_delayer.py --gtk
+
+    # Check if a kitty window with title "delayer" already exists
+    if ! kitty @ ls | grep -q '"title": "delayer"' ; then
+        kitty @ launch \
+            --location=hsplit \
+            --title delayer \
+            --cwd=current \
+            python /home/jake/AudioStreamer/2_device_delayer.py --gtk
+    fi
 fi
 
-# Move to ASHA4LINUX directory
-cd ASHA4LINUX || { echo "Failed to enter ASHA4LINUX directory"; exit 1; }
+# Move to AudioStreamer directory
+cd ASHA4LINUX || exit 1
 
-# Run connect.py with nice
+# Run connect.py with high priority
 nice -10 python connect.py -d -r -rof -da
