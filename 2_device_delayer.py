@@ -24,8 +24,8 @@ DEFAULT_CONFIG = {
 	'DESC3': 'Combined_Sink',
 	'TARGET1': os.environ.get('ASHA_SINK', 'asha_16450405641617933895'), 
 	'TARGET2': os.environ.get('BT_SINK', 'bluez_output.*_*_*_*_*_*.1'), # dont forget to update this
-	'LAT1': float(os.environ.get('ASHA_LAT', '0')), # highly dependant on the user's BT's latency with Qualcomm QCNCM865 on my current devices I have to set delay for ASHA to keep the audio combined for now I dont have a propbable way to control the left and right channels right now its only streaming all both to both.THe BT latency are NOT static unfortunately.
-	'LAT2': float(os.environ.get('BT_LAT', '60'))
+	'LAT1': float(os.environ.get('ASHA_LAT', '34')), # highly dependant on the user's BT's latency with Qualcomm QCNCM865 on my current devices I have to set delay for ASHA to keep the audio combined for now I dont have a propbable way to control the left and right channels right now its only streaming all both to both.THe BT latency are NOT static unfortunately.
+	'LAT2': float(os.environ.get('BT_LAT', '0'))
 }
 
 '''
