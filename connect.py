@@ -1181,7 +1181,7 @@ class BluetoothAshaManager:
 		else:
 			# Only trigger reset for primary device failures, not secondary
 			if device_type == "primary" and self.args.reset_on_failure:
-				log_warning("Failed to connect to primary %s — reset-on-failure triggered", mac)
+				log_warning(f"Failed to connect to primary {mac} — reset-on-failure triggered")
 				reset_evt.set()
 				self.cleanup()
 				os.execv(sys.executable, [sys.executable] + sys.argv)
