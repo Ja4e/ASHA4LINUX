@@ -157,6 +157,11 @@ def load_config(config_path: str) -> dict:
 					"ID": "00e4ca9e-ab14-41e4-8823-f9e70c7e91df",
 					"Value": "0xff",
 				},
+				# NEW: Secondary volume configuration
+				"Volume_Sec": {
+					"ID": "00e4ca9e-ab14-41e4-8823-f9e70c7e91df", 
+					"Value": "0xff",
+				},
 				"Trigger": {
 					"Boolean": True,
 					"Modes": "increment",
@@ -264,8 +269,9 @@ ALL_DEVICE_FILTERS = [device for device in ALL_DEVICE_FILTERS if device]
 # if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
 #	logger.info(f"Secondary reconnection: {SECONDARY_RECONNECTION_MODE} mode (initial: {SECONDARY_INITIAL_DELAY}s, max: {SECONDARY_MAX_DELAY}s)")
 
-# GATT Configuration
+# GATT Configuration - NEW: Separate UUID for secondary devices
 GATT_ATTRIBUTE: str = config["GATT"]["Volume"]["ID"] or "00e4ca9e-ab14-41e4-8823-f9e70c7e91df"
+GATT_ATTRIBUTE_SEC: str = config["GATT"]["Volume_Sec"]["ID"] or "00e4ca9e-ab14-41e4-8823-f9e70c7e91df"
 PER_DEVICE_VOLUME: bool = config["GATT"].get("Per_Device_Volume", True)
 
 # Global
@@ -1080,6 +1086,14 @@ class BluetoothAshaManager:
 			actual_device_type = self.device_manager.get_device_type(name)
 			logger.info(f"{Fore.GREEN}Connected to {name} ({mac}) as {actual_device_type}!{Style.RESET_ALL}")
 			
+			# NEW: Immediately execute GATT operations for secondary devices after connection
+			if actual_device_type == "secondary":
+				logger.info(f"{Fore.YELLOW}Executing immediate GATT operations for secondary device {name}{Style.RESET_ALL}")
+				# Use a small delay to ensure the connection is stable
+				time.sleep(1)
+				# Execute bluetoothctl connect to ensure proper GATT execution
+				self.execute_secondary_gatt_operations(mac, name)
+			
 			# Start ASHA immediately when primary connects
 			if actual_device_type == "primary" and self.operation_mode != "secondary_only":
 				with global_lock:
@@ -1126,6 +1140,48 @@ class BluetoothAshaManager:
 				
 			with global_lock:
 				processed_devices.discard(mac)
+
+	def execute_secondary_gatt_operations(self, mac: str, name: str) -> None:
+		"""NEW: Execute bluetoothctl connect and GATT operations specifically for secondary devices"""
+		try:
+			logger.info(f"{Fore.CYAN}Executing bluetoothctl connect for secondary device {name} to ensure GATT execution{Style.RESET_ALL}")
+			
+			# First, ensure the device is connected via bluetoothctl
+			connect_output = run_command(f"bluetoothctl connect {mac}", capture_output=True)
+			if connect_output and "Connection successful" in connect_output:
+				logger.info(f"{Fore.GREEN}Secondary device {name} connected via bluetoothctl{Style.RESET_ALL}")
+				
+				# Small delay to ensure connection is stable
+				time.sleep(0.5)
+				
+				# Now execute GATT operations with the secondary UUID
+				logger.info(f"{Fore.CYAN}Executing GATT operations for secondary device {name} with UUID {GATT_ATTRIBUTE_SEC}{Style.RESET_ALL}")
+				
+				process = subprocess.Popen(
+					["bluetoothctl"],
+					stdin=subprocess.PIPE,
+					stdout=subprocess.PIPE,
+					stderr=subprocess.PIPE,
+					text=True
+				)
+				
+				# Use the secondary UUID and volume value
+				volume_value = config["GATT"]["Volume_Sec"]["Value"]
+				commands = f"""connect {mac}
+gatt.select-attribute {GATT_ATTRIBUTE_SEC}
+gatt.write {volume_value}
+exit
+"""
+				stdout, stderr = process.communicate(commands)
+				if process.returncode == 0:
+					logger.info(f"{Fore.GREEN}Secondary GATT operations completed for {name} with volume {volume_value} and UUID {GATT_ATTRIBUTE_SEC}{Style.RESET_ALL}")
+				else:
+					logger.error(f"{Fore.RED}Secondary GATT operations failed for {name}: {stderr.strip()}{Style.RESET_ALL}")
+			else:
+				logger.warning(f"{Fore.YELLOW}Failed to connect to secondary device {name} via bluetoothctl{Style.RESET_ALL}")
+				
+		except Exception as e:
+			logger.error(f"{Fore.RED}Error executing secondary GATT operations for {name}: {e}{Style.RESET_ALL}")
 
 	def attempt_secondary_connections(self) -> None:
 		"""Immediately attempt to connect any available secondary devices after primary connects"""
@@ -1625,16 +1681,16 @@ class BluetoothAshaManager:
 									if mode == "burst":
 										for _ in range(frequency):
 											time.sleep(duration)
-											self.perform_gatt_operations(mac, name)
+											self.perform_gatt_operations(mac, name, device_type)
 									elif mode == "increment":
 										for i in range(1, frequency + 1):
 											delay = duration * i
 											time.sleep(delay)
-											self.perform_gatt_operations(mac, name)
+											self.perform_gatt_operations(mac, name, device_type)
 									else:
 										for _ in range(frequency):
 											time.sleep(duration)
-											self.perform_gatt_operations(mac, name)
+											self.perform_gatt_operations(mac, name, device_type)
 
 			except Exception as e:
 				if not shutdown_evt.is_set():
@@ -1642,12 +1698,19 @@ class BluetoothAshaManager:
 					reset_evt.set()
 				break
 
-	def perform_gatt_operations(self, mac_address: str, device_name: str) -> bool:
+	def perform_gatt_operations(self, mac_address: str, device_name: str, device_type: str) -> bool:
 		"""Perform GATT operations by connecting to the device"""
 		# Get device-specific volume or use default
 		volume_value = self.device_manager.get_device_volume(mac_address, self.volume_value)
 		
-		logger.info(f"Starting GATT operations for {device_name} with volume value: {volume_value}")
+		# NEW: Use different UUID for secondary devices
+		if device_type == "secondary":
+			gatt_uuid = GATT_ATTRIBUTE_SEC
+			logger.info(f"Using secondary UUID for {device_name}: {gatt_uuid}")
+		else:
+			gatt_uuid = GATT_ATTRIBUTE
+		
+		logger.info(f"Starting GATT operations for {device_name} with volume value: {volume_value}, UUID: {gatt_uuid}")
 		try:
 			process = subprocess.Popen(
 				["bluetoothctl"],
@@ -1657,13 +1720,13 @@ class BluetoothAshaManager:
 				text=True
 			)
 			commands = f"""connect {mac_address}
-gatt.select-attribute {GATT_ATTRIBUTE}
+gatt.select-attribute {gatt_uuid}
 gatt.write {volume_value}
 exit
 """
 			stdout, stderr = process.communicate(commands)
 			if process.returncode == 0:
-				logger.info(f"{Fore.GREEN}GATT operations completed with volume {volume_value}{Style.RESET_ALL}")
+				logger.info(f"{Fore.GREEN}GATT operations completed with volume {volume_value} and UUID {gatt_uuid}{Style.RESET_ALL}")
 				return True
 			else:
 				logger.error(f"{Fore.RED}GATT operations failed: {stderr.strip()}{Style.RESET_ALL}")
