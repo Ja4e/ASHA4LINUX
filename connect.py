@@ -86,7 +86,6 @@ Usually, if connection return try to restart this device and try to rerun the sc
 """
 This script aims to assist all annonying G.722 bluetooth connection issues 
 """
-
 # ==============
 #  DEPENDENCIES
 # ==============
@@ -276,8 +275,8 @@ def load_config(config_path: str) -> dict:
 				"DESC3": "Combined_Sink",
 				"TARGET1": os.environ.get('ASHA_SINK', 'asha_16450405641617933895'),  # dont forget to update this
 				"TARGET2": os.environ.get('BT_SINK', 'bluez_output.XX_XX_XX_XX_XX_XX.1'), # dont forget to update this Do use  "pactl list short sinks" to find the proper sink name (its persistent)
-				"LAT1": int(os.environ.get('ASHA_LAT', '34')), # highly dependant on the user's BT's latency with Qualcomm QCNCM865 on my current devices I have to set delay for ASHA to keep the audio combined for now I dont have a propbable way to control the left and right channels right now its only streaming all both to both.THe BT latency are NOT static unfortunately.
-				"LAT2": int(os.environ.get('BT_LAT', '0')),
+				"LAT1": 34,  # Default value from config, completely separate from GTK UI
+				"LAT2": 0,   # Default value from config, completely separate from GTK UI
 				"CHAN1": "both",  # "left", "right", "both"
 				"CHAN2": "both",  # "left", "right", "both"
 				"Auto_Adjust": True,
@@ -364,7 +363,7 @@ DELAY_ONLY_AFTER_BOTH: bool = config["Connection_Delay"].get("Only_After_Both", 
 DELAY_APPLY_TO: str = config["Connection_Delay"].get("Apply_To", "all")  # "all", "primary", "secondary"
 DELAY_RESET_AFTER_DISCONNECT: bool = config["Connection_Delay"].get("Reset_After_Disconnect", True)
 
-# Extract audio combiner settings
+# Extract audio combiner settings - get from config only
 AUDIO_COMBINER_ENABLED: bool = config["AudioCombiner"].get("Enabled", False)
 AUDIO_GTK_UI_ENABLED: bool = config["AudioCombiner"].get("GTK_UI", False)
 AUDIO_SINK1: str = config["AudioCombiner"].get("SINK1", "sink_asha")
@@ -375,8 +374,45 @@ AUDIO_DESC2: str = config["AudioCombiner"].get("DESC2", "BT_Sink")
 AUDIO_DESC3: str = config["AudioCombiner"].get("DESC3", "Combined_Sink")
 AUDIO_TARGET1: str = config["AudioCombiner"].get("TARGET1", os.environ.get('ASHA_SINK', 'asha_16450405641617933895'))
 AUDIO_TARGET2: str = config["AudioCombiner"].get("TARGET2", os.environ.get('BT_SINK', 'bluez_output.XX_XX_XX_XX_XX_XX.1'))
-AUDIO_LAT1: int = config["AudioCombiner"].get("LAT1", int(os.environ.get('ASHA_LAT', '34')))
-AUDIO_LAT2: int = config["AudioCombiner"].get("LAT2", int(os.environ.get('BT_LAT', '0')))
+
+# Get CONFIG latencies - these are separate from GTK UI values
+CONFIG_LAT1: int = config["AudioCombiner"].get("LAT1", 34)  # From config file only
+CONFIG_LAT2: int = config["AudioCombiner"].get("LAT2", 0)   # From config file only
+
+# GTK UI values start as None - will be set when GTK UI starts
+GTK_UI_LAT1: Optional[int] = None
+GTK_UI_LAT2: Optional[int] = None
+
+# Initialize with config values for audio combiner startup
+AUDIO_LAT1: int = CONFIG_LAT1  # Initial value from config
+AUDIO_LAT2: int = CONFIG_LAT2  # Initial value from config
+
+# Store current active latencies (can be overridden by GTK UI later)
+current_lat1 = AUDIO_LAT1
+current_lat2 = AUDIO_LAT2
+
+# Command line environment variables can override initial values for this session
+env_lat1 = os.environ.get('ASHA_LAT')
+env_lat2 = os.environ.get('BT_LAT')
+
+if env_lat1:
+	try:
+		current_lat1 = int(env_lat1)
+		log_info(f"Using environment variable ASHA_LAT={current_lat1} for this session", Fore.YELLOW)
+	except ValueError:
+		log_warning(f"Invalid ASHA_LAT environment variable: {env_lat1}, using config value: {CONFIG_LAT1}")
+
+if env_lat2:
+	try:
+		current_lat2 = int(env_lat2)
+		log_info(f"Using environment variable BT_LAT={current_lat2} for this session", Fore.YELLOW)
+	except ValueError:
+		log_warning(f"Invalid BT_LAT environment variable: {env_lat2}, using config value: {CONFIG_LAT2}")
+
+# Update initial latencies
+AUDIO_LAT1 = current_lat1
+AUDIO_LAT2 = current_lat2
+
 AUDIO_CHAN1: str = config["AudioCombiner"].get("CHAN1", "both")
 AUDIO_CHAN2: str = config["AudioCombiner"].get("CHAN2", "both")
 AUDIO_AUTO_ADJUST: bool = config["AudioCombiner"].get("Auto_Adjust", True)
@@ -385,7 +421,6 @@ AUDIO_MONITOR_INTERVAL: float = config["AudioCombiner"].get("Monitor_Interval", 
 '''
 WARNING!
 DO NOT USE EASYEFFECT WITH THIS IT WILL BREAK
-
 
 also it ONLY STREAMS TO DOUBLE CHANNEL BY DEFAULT using with left or right automatically will not work properly for BT devices
 you can try use pwvucontrol software to control the channel
@@ -417,7 +452,7 @@ if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
 if CONNECTION_DELAY_ENABLED:
 	log_info(f"Connection delay: {CONNECTION_DELAY_SECONDS}s (only after both: {DELAY_ONLY_AFTER_BOTH}, apply to: {DELAY_APPLY_TO})", Fore.CYAN)
 if AUDIO_COMBINER_ENABLED:
-	log_info(f"Audio combiner enabled: {AUDIO_SINK1}+{AUDIO_SINK2} -> {AUDIO_COMBINED} (latencies: {AUDIO_LAT1}ms/{AUDIO_LAT2}ms)", Fore.MAGENTA)
+	log_info(f"Audio combiner enabled: {AUDIO_SINK1}+{AUDIO_SINK2} -> {AUDIO_COMBINED} (initial latencies: {AUDIO_LAT1}ms/{AUDIO_LAT2}ms)", Fore.MAGENTA)
 	if AUDIO_GTK_UI_ENABLED or ENV_GTK_UI:
 		log_info(f"GTK UI enabled for audio combiner", Fore.CYAN)
 
@@ -484,7 +519,6 @@ audio_combiner_manager: Optional[Any] = None
 gtk_ui_thread: Optional[threading.Thread] = None
 gtk_ui_stop = threading.Event()
 gtk_window = None
-gtk_latency_queue = queue.Queue()
 
 # ------------------------------
 # ASYNC EVENT LOOP MANAGEMENT
@@ -682,23 +716,27 @@ class AudioCombinerManager:
 	
 	def __init__(self, config: Dict[str, Any]):
 		self.config = config
-		# Get latencies from config (not from environment at this point)
-		lat1 = config.get('LAT1', AUDIO_LAT1)
-		lat2 = config.get('LAT2', AUDIO_LAT2)
+		# Store initial latencies from config
+		self.initial_lat1 = config.get('LAT1', AUDIO_LAT1)
+		self.initial_lat2 = config.get('LAT2', AUDIO_LAT2)
+		
+		# Start with initial values, but GTK UI can override them
+		self.current_lat1 = self.initial_lat1
+		self.current_lat2 = self.initial_lat2
 		
 		self.sink1 = Sink(
 			config['SINK1'], 
 			config['TARGET1'], 
 			config['DESC1'], 
 			config.get('CHAN1', 'both'), 
-			int(lat1)
+			int(self.current_lat1)
 		)
 		self.sink2 = Sink(
 			config['SINK2'], 
 			config['TARGET2'], 
 			config['DESC2'], 
 			config.get('CHAN2', 'both'), 
-			int(lat2)
+			int(self.current_lat2)
 		)
 		self.comb_sink = CombinedSink(
 			config['COMB'], 
@@ -707,8 +745,6 @@ class AudioCombinerManager:
 		)
 		self._cached_sinks: Set[str] = set()
 		self.monitor_thread: Optional[threading.Thread] = None
-		self._last_config_lat1 = lat1
-		self._last_config_lat2 = lat2
 		
 	def _refresh_sink_cache(self) -> Set[str]:
 		"""Refresh cache of available audio sinks"""
@@ -720,7 +756,6 @@ class AudioCombinerManager:
 				if len(parts) >= 2:
 					current.add(parts[1])
 		self._cached_sinks = current
-		# log_debug(f"Refreshed sink cache: {current}")
 		return current
 	
 	def wait_for_sink_target(self, target: str, timeout: float = 30.0) -> bool:
@@ -762,7 +797,7 @@ class AudioCombinerManager:
 	
 	def monitor_loop(self) -> None:
 		"""Monitor audio sinks and adjust as needed"""
-		log_audio("Starting audio combiner monitor loop (session-only latencies)")
+		log_audio(f"Starting audio combiner monitor loop with latencies: {self.current_lat1}ms/{self.current_lat2}ms")
 		self._refresh_sink_cache()
 		
 		while not audio_combiner_stop.is_set():
@@ -781,15 +816,6 @@ class AudioCombinerManager:
 					self.sink2.create_loopback()
 					self.comb_sink.update_slaves([self.sink1.name, self.sink2.name])
 				
-				# Check for latency updates from GTK UI (session-only)
-				try:
-					while not gtk_latency_queue.empty():
-						lat1, lat2 = gtk_latency_queue.get_nowait()
-						log_audio(f"Received latency update from GTK UI (session-only): {lat1}ms, {lat2}ms")
-						self.set_latencies(lat1, lat2)
-				except queue.Empty:
-					pass
-				
 				# Clean up zombies periodically
 				if time.monotonic() % 10 < 1:  # Every ~10 seconds
 					self.cleanup_zombie_modules()
@@ -801,24 +827,30 @@ class AudioCombinerManager:
 				time.sleep(2.0)
 	
 	def set_latencies(self, lat1_ms: int, lat2_ms: int, force_update: bool = True) -> None:
-		"""Update audio sink latencies without saving to config file"""
+		"""Update audio sink latencies - completely independent from config"""
 		# Only update if values actually changed
-		if self.sink1.latency == lat1_ms and self.sink2.latency == lat2_ms and not force_update:
+		if self.current_lat1 == lat1_ms and self.current_lat2 == lat2_ms and not force_update:
 			log_debug("Latencies unchanged, skipping update")
 			return
 			
-		log_audio(f"Updating latencies: sink1={lat1_ms}ms sink2={lat2_ms}ms (session only)")
+		log_audio(f"Updating latencies: sink1={lat1_ms}ms sink2={lat2_ms}ms")
 		
-		# Store the new values
-		self.sink1.latency = int(lat1_ms)
-		self.sink2.latency = int(lat2_ms)
+		# Update current latencies
+		self.current_lat1 = int(lat1_ms)
+		self.current_lat2 = int(lat2_ms)
 		
-		# DO NOT update config dictionary - session only
+		# Update sink latencies
+		self.sink1.latency = self.current_lat1
+		self.sink2.latency = self.current_lat2
+		
+		# DO NOT update config dictionary
 		# DO NOT call save_config()
+		# DO NOT update environment variables
 		
-		# Update environment variables for current session
-		os.environ['ASHA_LAT'] = str(lat1_ms)
-		os.environ['BT_LAT'] = str(lat2_ms)
+		# Update GTK UI global variables (for GTK UI display only)
+		global GTK_UI_LAT1, GTK_UI_LAT2
+		GTK_UI_LAT1 = self.current_lat1
+		GTK_UI_LAT2 = self.current_lat2
 		
 		# Only recreate loopbacks if they exist
 		if self.sink1.loopback_id:
@@ -836,12 +868,13 @@ class AudioCombinerManager:
 	
 	def get_latencies(self) -> Tuple[int, int]:
 		"""Get current latencies"""
-		return self.sink1.latency, self.sink2.latency
+		return self.current_lat1, self.current_lat2
 	
 	def start(self) -> bool:
 		"""Start the audio combiner"""
 		try:
-			log_audio("Starting audio combiner (GTK UI changes are session-only)...")
+			log_audio(f"Starting audio combiner with initial latencies: {self.current_lat1}ms/{self.current_lat2}ms")
+			log_audio("GTK UI changes are completely independent from config")
 			
 			# Get original default sink
 			orig_default_sink = run_cmd(['pactl', 'get-default-sink'], capture=True) or ''
@@ -865,7 +898,7 @@ class AudioCombinerManager:
 			self.sink1.create_null_sink()
 			self.sink2.create_null_sink()
 			
-			# Create loopbacks
+			# Create loopbacks with current latencies
 			self.sink1.create_loopback()
 			self.sink2.create_loopback()
 			
@@ -881,7 +914,7 @@ class AudioCombinerManager:
 			
 			log_audio(f"Audio combiner ready. Original volumes: {vol1} / {vol2}")
 			log_audio(f"Original default sink: {orig_default_sink}")
-			log_audio("Note: GTK UI latency changes are session-only and will not persist")
+			log_audio("GTK UI latency changes are completely independent from config")
 			
 			# Start monitor thread
 			self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
@@ -925,222 +958,237 @@ class AudioCombinerManager:
 		log_audio("Audio combiner stopped")
 
 # ------------------------------
-# GTK UI CLASS (GTK4 VERSION)
+# GTK UI CLASS (GTK4 VERSION) - COMPLETELY INDEPENDENT
 # ------------------------------
 class GtkLatencyUI:
-    def __init__(self):
-        self.app = None
-        self.window = None
-        self.spin1 = None
-        self.spin2 = None
-        self.status_label = None
-        self.running = False
+	def __init__(self):
+		self.app = None
+		self.window = None
+		self.spin1 = None
+		self.spin2 = None
+		self.status_label = None
+		self.running = False
+		# GTK UI maintains its own COMPLETELY INDEPENDENT state
+		self.current_lat1 = AUDIO_LAT1  # Start with initial session values
+		self.current_lat2 = AUDIO_LAT2
 
-    def run(self):
-        import gi
-        gi.require_version("Gtk", "4.0")
-        from gi.repository import Gtk, GLib
-        
-        class LatencyApp(Gtk.Application):
-            def __init__(self):
-                super().__init__(application_id="org.example.latencyui")
-                self.window = None
-                self.spin1 = None
-                self.spin2 = None
-                self.status_label = None
-                
-            def do_activate(self):
-                # Create the main window
-                self.window = Gtk.ApplicationWindow(application=self)
-                self.window.set_title("Adjust Sink Latencies (ms) - Session Only")
-                self.window.set_default_size(400, 180)
-                self.window.set_resizable(True)
-                
-                # Main vertical box
-                vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-                vbox.set_margin_top(12)
-                vbox.set_margin_bottom(12)
-                vbox.set_margin_start(12)
-                vbox.set_margin_end(12)
-                self.window.set_child(vbox)
-                
-                # Create grid for controls
-                grid = Gtk.Grid()
-                grid.set_row_spacing(6)
-                grid.set_column_spacing(12)
-                grid.set_halign(Gtk.Align.CENTER)
-                vbox.append(grid)
-                
-                # Labels
-                label1 = Gtk.Label(label="Sink 1 (ASHA) latency (ms):")
-                label1.set_halign(Gtk.Align.START)
-                
-                label2 = Gtk.Label(label="Sink 2 (BT) latency (ms):")
-                label2.set_halign(Gtk.Align.START)
-                
-                # Spin buttons
-                self.spin1 = Gtk.SpinButton.new_with_range(0, 2000, 1)
-                self.spin1.set_value(AUDIO_LAT1)
-                self.spin1.set_hexpand(True)
-                
-                self.spin2 = Gtk.SpinButton.new_with_range(0, 2000, 1)
-                self.spin2.set_value(AUDIO_LAT2)
-                self.spin2.set_hexpand(True)
-                
-                # Status label
-                self.status_label = Gtk.Label(
-                    label=f"Current: ASHA={AUDIO_LAT1}ms, BT={AUDIO_LAT2}ms (session only)"
-                )
-                self.status_label.set_halign(Gtk.Align.CENTER)
-                
-                # Attach widgets to grid
-                grid.attach(label1, 0, 0, 1, 1)
-                grid.attach(self.spin1, 1, 0, 1, 1)
-                grid.attach(label2, 0, 1, 1, 1)
-                grid.attach(self.spin2, 1, 1, 1, 1)
-                grid.attach(self.status_label, 0, 2, 2, 1)
-                
-                # Button box
-                button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-                button_box.set_halign(Gtk.Align.END)
-                button_box.set_margin_top(12)
-                vbox.append(button_box)
-                
-                # Buttons
-                reset_btn = Gtk.Button(label="Reset to defaults")
-                apply_btn = Gtk.Button(label="Apply (Session Only)")
-                close_btn = Gtk.Button(label="Close UI")
-                
-                reset_btn.connect("clicked", self.on_reset_to_defaults)
-                apply_btn.connect("clicked", self.on_apply)
-                close_btn.connect("clicked", self.on_close)
-                
-                button_box.append(reset_btn)
-                button_box.append(apply_btn)
-                button_box.append(close_btn)
-                
-                # Connect window close event
-                self.window.connect("close-request", self.on_close_request)
-                
-                # Present the window
-                self.window.present()
-                
-                # Store references in the outer class
-                ui.window = self.window
-                ui.spin1 = self.spin1
-                ui.spin2 = self.spin2
-                ui.status_label = self.status_label
-                ui.running = True
-                
-                # Start periodic update
-                GLib.timeout_add_seconds(2, self.update_latencies)
-                
-                # Check for stop signal
-                GLib.timeout_add(500, self.check_stop)
-            
-            def on_apply(self, btn):
-                if not self.spin1 or not self.spin2:
-                    return
-                lat1 = int(self.spin1.get_value())
-                lat2 = int(self.spin2.get_value())
-                gtk_latency_queue.put((lat1, lat2))
-                
-                os.environ["ASHA_LAT"] = str(lat1)
-                os.environ["BT_LAT"] = str(lat2)
-                
-                if self.status_label:
-                    self.status_label.set_label(
-                        f"Current: ASHA={lat1}ms, BT={lat2}ms (session only)"
-                    )
-            
-            def on_reset_to_defaults(self, btn):
-                if self.spin1:
-                    self.spin1.set_value(34)
-                if self.spin2:
-                    self.spin2.set_value(0)
-                self.on_apply(btn)
-            
-            def on_close(self, btn):
-                global gtk_ui_stop
-                gtk_ui_stop.set()
-                if self.window:
-                    self.window.close()
-            
-            def on_close_request(self, window):
-                global gtk_ui_stop
-                gtk_ui_stop.set()
-                return False  # Allow window to close
-            
-            def update_latencies(self):
-                if audio_combiner_manager and not gtk_ui_stop.is_set():
-                    try:
-                        lat1, lat2 = audio_combiner_manager.get_latencies()
-                        
-                        if self.spin1 and not self.spin1.has_focus():
-                            self.spin1.set_value(lat1)
-                        if self.spin2 and not self.spin2.has_focus():
-                            self.spin2.set_value(lat2)
-                        
-                        if self.status_label:
-                            self.status_label.set_label(
-                                f"Current: ASHA={lat1}ms, BT={lat2}ms (session only)"
-                            )
-                    except Exception as e:
-                        log_debug(f"Error updating latencies: {e}")
-                
-                return not gtk_ui_stop.is_set()  # Continue if not stopped
-            
-            def check_stop(self):
-                if gtk_ui_stop.is_set():
-                    if self.window:
-                        self.window.close()
-                    ui.running = False
-                    return False
-                return True
-        
-        # Create and run the application
-        ui = self
-        app = LatencyApp()
-        self.app = app
-        
-        # Run the application
-        app.run(None)
+	def run(self):
+		import gi
+		gi.require_version("Gtk", "4.0")
+		from gi.repository import Gtk, GLib
+		
+		class LatencyApp(Gtk.Application):
+			def __init__(self):
+				super().__init__(application_id="org.example.latencyui")
+				self.window = None
+				self.spin1 = None
+				self.spin2 = None
+				self.status_label = None
+				self._pending_changes = False  # Track if user has unsaved changes
+				
+			def do_activate(self):
+				# Get initial values from GTK UI's own state
+				initial_lat1 = ui.current_lat1
+				initial_lat2 = ui.current_lat2
+				
+				# Create the main window
+				self.window = Gtk.ApplicationWindow(application=self)
+				self.window.set_title("Adjust Sink Latencies (ms) - Independent Control")
+				self.window.set_default_size(400, 200)
+				self.window.set_resizable(True)
+				
+				# Main vertical box
+				vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+				vbox.set_margin_top(12)
+				vbox.set_margin_bottom(12)
+				vbox.set_margin_start(12)
+				vbox.set_margin_end(12)
+				self.window.set_child(vbox)
+				
+				# Info label
+				info_label = Gtk.Label(
+					label="GTK UI controls are completely independent.\nChanges only take effect when you click 'Apply'."
+				)
+				info_label.set_halign(Gtk.Align.CENTER)
+				info_label.set_margin_bottom(12)
+				vbox.append(info_label)
+				
+				# Create grid for controls
+				grid = Gtk.Grid()
+				grid.set_row_spacing(6)
+				grid.set_column_spacing(12)
+				grid.set_halign(Gtk.Align.CENTER)
+				vbox.append(grid)
+				
+				# Labels
+				label1 = Gtk.Label(label="Sink 1 (ASHA) latency (ms):")
+				label1.set_halign(Gtk.Align.START)
+				
+				label2 = Gtk.Label(label="Sink 2 (BT) latency (ms):")
+				label2.set_halign(Gtk.Align.START)
+				
+				# Spin buttons - use GTK UI's own state
+				self.spin1 = Gtk.SpinButton.new_with_range(0, 2000, 1)
+				self.spin1.set_value(initial_lat1)
+				self.spin1.set_hexpand(True)
+				self.spin1.connect("value-changed", self.on_spin_changed)
+				
+				self.spin2 = Gtk.SpinButton.new_with_range(0, 2000, 1)
+				self.spin2.set_value(initial_lat2)
+				self.spin2.set_hexpand(True)
+				self.spin2.connect("value-changed", self.on_spin_changed)
+				
+				# Status label
+				self.status_label = Gtk.Label(
+					label=f"Current GTK UI values: ASHA={initial_lat1}ms, BT={initial_lat2}ms"
+				)
+				self.status_label.set_halign(Gtk.Align.CENTER)
+				
+				# Attach widgets to grid
+				grid.attach(label1, 0, 0, 1, 1)
+				grid.attach(self.spin1, 1, 0, 1, 1)
+				grid.attach(label2, 0, 1, 1, 1)
+				grid.attach(self.spin2, 1, 1, 1, 1)
+				grid.attach(self.status_label, 0, 2, 2, 1)
+				
+				# Button box
+				button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+				button_box.set_halign(Gtk.Align.END)
+				button_box.set_margin_top(12)
+				vbox.append(button_box)
+				
+				# Buttons
+				reset_btn = Gtk.Button(label="Reset to session start")
+				apply_btn = Gtk.Button(label="Apply Now")
+				close_btn = Gtk.Button(label="Close UI")
+				
+				reset_btn.connect("clicked", self.on_reset_to_session_start)
+				apply_btn.connect("clicked", self.on_apply)
+				close_btn.connect("clicked", self.on_close)
+				
+				button_box.append(reset_btn)
+				button_box.append(apply_btn)
+				button_box.append(close_btn)
+				
+				# Connect window close event
+				self.window.connect("close-request", self.on_close_request)
+				
+				# Present the window
+				self.window.present()
+				
+				# Store references in the outer class
+				ui.window = self.window
+				ui.spin1 = self.spin1
+				ui.spin2 = self.spin2
+				ui.status_label = self.status_label
+				ui.running = True
+				
+				# Check for stop signal
+				GLib.timeout_add(500, self.check_stop)
+			
+			def on_spin_changed(self, spin):
+				"""Track when user changes values"""
+				self._pending_changes = True
+				if self.status_label:
+					lat1 = self.spin1.get_value() if self.spin1 else ui.current_lat1
+					lat2 = self.spin2.get_value() if self.spin2 else ui.current_lat2
+					self.status_label.set_label(
+						f"Pending changes: ASHA={lat1}ms, BT={lat2}ms (click Apply)"
+					)
+			
+			def on_apply(self, btn):
+				if not self.spin1 or not self.spin2:
+					return
+				lat1 = int(self.spin1.get_value())
+				lat2 = int(self.spin2.get_value())
+				
+				# Update GTK UI's own state
+				ui.current_lat1 = lat1
+				ui.current_lat2 = lat2
+				
+				# Send DIRECTLY to audio combiner (bypass queue)
+				if audio_combiner_manager:
+					log_audio(f"GTK UI applying latencies: {lat1}ms, {lat2}ms")
+					audio_combiner_manager.set_latencies(lat1, lat2)
+				
+				self._pending_changes = False
+				
+				if self.status_label:
+					self.status_label.set_label(
+						f"Applied: ASHA={lat1}ms, BT={lat2}ms"
+					)
+			
+			def on_reset_to_session_start(self, btn):
+				# Reset to session start values (AUDIO_LAT1/AUDIO_LAT2)
+				if self.spin1:
+					self.spin1.set_value(AUDIO_LAT1)
+				if self.spin2:
+					self.spin2.set_value(AUDIO_LAT2)
+				self._pending_changes = True
+				self.on_apply(btn)  # Auto-apply reset
+			
+			def on_close(self, btn):
+				global gtk_ui_stop
+				gtk_ui_stop.set()
+				if self.window:
+					self.window.close()
+			
+			def on_close_request(self, window):
+				global gtk_ui_stop
+				gtk_ui_stop.set()
+				return False  # Allow window to close
+			
+			def check_stop(self):
+				if gtk_ui_stop.is_set():
+					if self.window:
+						self.window.close()
+					ui.running = False
+					return False
+				return True
+		
+		# Create and run the application
+		ui = self
+		app = LatencyApp()
+		self.app = app
+		
+		# Run the application
+		app.run(None)
 
 
 def start_gtk_ui():
-    """Start GTK UI in a separate thread"""
-    global gtk_ui_thread
-    if gtk_ui_thread and gtk_ui_thread.is_alive():
-        log_gtk("GTK UI already running")
-        return
-    
-    gtk_ui_stop.clear()
-    gtk_ui_thread = threading.Thread(target=_gtk_ui_worker, daemon=True)
-    gtk_ui_thread.start()
-    log_gtk("GTK UI thread started")
+	"""Start GTK UI in a separate thread"""
+	global gtk_ui_thread
+	if gtk_ui_thread and gtk_ui_thread.is_alive():
+		log_gtk("GTK UI already running")
+		return
+	
+	gtk_ui_stop.clear()
+	gtk_ui_thread = threading.Thread(target=_gtk_ui_worker, daemon=True)
+	gtk_ui_thread.start()
+	log_gtk("GTK UI thread started")
 
 def _gtk_ui_worker():
-    """Worker function for GTK UI thread"""
-    # Set the GTK thread name for debugging
-    threading.current_thread().name = "GTK-UI-Thread"
-    
-    # Create and run the UI
-    gtk_ui = GtkLatencyUI()
-    try:
-        gtk_ui.run()
-    except Exception as e:
-        log_error(f"GTK UI error: {e}")
-    finally:
-        log_gtk("GTK UI thread exiting")
+	"""Worker function for GTK UI thread"""
+	# Set the GTK thread name for debugging
+	threading.current_thread().name = "GTK-UI-Thread"
+	
+	# Create and run the UI
+	gtk_ui = GtkLatencyUI()
+	try:
+		gtk_ui.run()
+	except Exception as e:
+		log_error(f"GTK UI error: {e}")
+	finally:
+		log_gtk("GTK UI thread exiting")
 
 def stop_gtk_ui():
-    """Stop GTK UI"""
-    global gtk_ui_thread
-    gtk_ui_stop.set()
-    if gtk_ui_thread and gtk_ui_thread.is_alive():
-        gtk_ui_thread.join(timeout=2.0)
-        gtk_ui_thread = None
-    log_gtk("GTK UI stopped")
+	"""Stop GTK UI"""
+	global gtk_ui_thread
+	gtk_ui_stop.set()
+	if gtk_ui_thread and gtk_ui_thread.is_alive():
+		gtk_ui_thread.join(timeout=2.0)
+		gtk_ui_thread = None
+	log_gtk("GTK UI stopped")
 
 # ------------------------------
 # PROCESS MANAGEMENT UTILITIES
@@ -1691,7 +1739,7 @@ class DeviceManager:
 			
 			# Start GTK UI if enabled
 			if self.gtk_enabled and (AUDIO_GTK_UI_ENABLED or ENV_GTK_UI):
-				log_gtk("Starting GTK UI for audio combiner (session-only mode)")
+				log_gtk("Starting GTK UI for audio combiner (completely independent from config)")
 				start_gtk_ui()
 	
 	def remove_connected_device(self, mac: str, secondary_reconnect_enabled: bool = True) -> None:
@@ -1809,7 +1857,7 @@ class DeviceManager:
 			if audio_combiner_started.is_set():
 				status_str += " [AUDIO COMBINED]"
 				if self.gtk_enabled and (AUDIO_GTK_UI_ENABLED or ENV_GTK_UI):
-					status_str += " [GTK UI - SESSION ONLY]"
+					status_str += " [GTK UI - INDEPENDENT]"
 			
 		return f"{status_str} ({total_count}/{MAX_DEVICES} total)"
 	
@@ -1942,13 +1990,15 @@ class BluetoothAshaManager:
 			log_info(f"Audio combiner {'enabled' if AUDIO_COMBINER_ENABLED else 'disabled'} via command line", Fore.MAGENTA)
 		
 		if hasattr(args, 'lat1') and args.lat1 is not None:
-			global AUDIO_LAT1
+			global AUDIO_LAT1, current_lat1
 			AUDIO_LAT1 = args.lat1
+			current_lat1 = args.lat1
 			log_info(f"Audio latency 1 set to {AUDIO_LAT1}ms via command line", Fore.MAGENTA)
 		
 		if hasattr(args, 'lat2') and args.lat2 is not None:
-			global AUDIO_LAT2
+			global AUDIO_LAT2, current_lat2
 			AUDIO_LAT2 = args.lat2
+			current_lat2 = args.lat2
 			log_info(f"Audio latency 2 set to {AUDIO_LAT2}ms via command line", Fore.MAGENTA)
 		
 		# GTK UI command line override
