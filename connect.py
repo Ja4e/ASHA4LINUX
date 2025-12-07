@@ -86,8 +86,10 @@ Usually, if connection return try to restart this device and try to rerun the sc
 """
 This script aims to assist all annonying G.722 bluetooth connection issues 
 """
-#!/usr/bin/env python3
 
+# ==============
+#  DEPENDENCIES
+# ==============
 import os
 import pty
 import subprocess
@@ -112,6 +114,7 @@ import fcntl
 import termios
 import json
 import psutil
+import queue
 
 colorama_init(autoreset=True)
 
@@ -187,6 +190,18 @@ def log_reconnection(message: str) -> None:
 	"""Consistent reconnection logging"""
 	logger.info(f"{Fore.MAGENTA}[RECONN] {message}{Style.RESET_ALL}")
 
+def log_delay(message: str) -> None:
+	"""Consistent delay logging"""
+	logger.info(f"{Fore.CYAN}[DELAY] {message}{Style.RESET_ALL}")
+
+def log_audio(message: str) -> None:
+	"""Consistent audio sink logging"""
+	logger.info(f"{Fore.MAGENTA}[AUDIO] {message}{Style.RESET_ALL}")
+
+def log_gtk(message: str) -> None:
+	"""Consistent GTK UI logging"""
+	logger.info(f"{Fore.CYAN}[GTK] {message}{Style.RESET_ALL}")
+
 # ------------------------------
 # CONFIGURATION
 # ------------------------------
@@ -243,6 +258,31 @@ def load_config(config_path: str) -> dict:
 					"Backoff_Multiplier": 1.5
 				}
 			},
+			"Connection_Delay": {
+				"Enabled": False,
+				"Delay_Seconds": 5.0,
+				"Only_After_Both": True,
+				"Apply_To": "all",  # "all", "primary", "secondary"
+				"Reset_After_Disconnect": True
+			},
+			"AudioCombiner": {
+				"Enabled": True,
+				"GTK_UI": False,
+				"SINK1": "sink_asha",
+				"SINK2": "sink_bt",
+				"COMB": "sink_combined",
+				"DESC1": "ASHA_Sink",
+				"DESC2": "BT_Sink",
+				"DESC3": "Combined_Sink",
+				"TARGET1": os.environ.get('ASHA_SINK', 'asha_16450405641617933895'),  # dont forget to update this
+				"TARGET2": os.environ.get('BT_SINK', 'bluez_output.XX_XX_XX_XX_XX_XX.1'), # dont forget to update this Do use  "pactl list short sinks" to find the proper sink name (its persistent)
+				"LAT1": int(os.environ.get('ASHA_LAT', '34')), # highly dependant on the user's BT's latency with Qualcomm QCNCM865 on my current devices I have to set delay for ASHA to keep the audio combined for now I dont have a propbable way to control the left and right channels right now its only streaming all both to both.THe BT latency are NOT static unfortunately.
+				"LAT2": int(os.environ.get('BT_LAT', '0')),
+				"CHAN1": "both",  # "left", "right", "both"
+				"CHAN2": "both",  # "left", "right", "both"
+				"Auto_Adjust": True,
+				"Monitor_Interval": 1.0
+			},
 			"Blacklist": [
 				"AudioStream Adapter DFU",
 			]
@@ -289,6 +329,16 @@ def load_config(config_path: str) -> dict:
 
 	return default_config
 
+def save_config():
+	"""Save the current configuration to file"""
+	with global_lock:
+		try:
+			with open(CONFIG_PATH, 'w') as f:
+				json.dump(config, f, indent=4)
+			log_config("Configuration saved to file")
+		except Exception as e:
+			log_error(f"Failed to save config: {e}")
+
 # Path to configuration file
 CONFIG_PATH = os.path.expanduser(config_path)
 config = load_config(CONFIG_PATH)
@@ -306,6 +356,44 @@ SECONDARY_INITIAL_DELAY: float = config["Reconnection"]["Secondary"].get("Initia
 SECONDARY_MAX_DELAY: float = config["Reconnection"]["Secondary"].get("Max_Delay", 60.0)
 SECONDARY_MAX_ATTEMPTS: int = config["Reconnection"]["Secondary"].get("Max_Attempts", 10)
 SECONDARY_BACKOFF_MULTIPLIER: float = config["Reconnection"]["Secondary"].get("Backoff_Multiplier", 1.5)
+
+# Extract connection delay settings
+CONNECTION_DELAY_ENABLED: bool = config["Connection_Delay"].get("Enabled", False)
+CONNECTION_DELAY_SECONDS: float = config["Connection_Delay"].get("Delay_Seconds", 5.0)
+DELAY_ONLY_AFTER_BOTH: bool = config["Connection_Delay"].get("Only_After_Both", True)
+DELAY_APPLY_TO: str = config["Connection_Delay"].get("Apply_To", "all")  # "all", "primary", "secondary"
+DELAY_RESET_AFTER_DISCONNECT: bool = config["Connection_Delay"].get("Reset_After_Disconnect", True)
+
+# Extract audio combiner settings
+AUDIO_COMBINER_ENABLED: bool = config["AudioCombiner"].get("Enabled", False)
+AUDIO_GTK_UI_ENABLED: bool = config["AudioCombiner"].get("GTK_UI", False)
+AUDIO_SINK1: str = config["AudioCombiner"].get("SINK1", "sink_asha")
+AUDIO_SINK2: str = config["AudioCombiner"].get("SINK2", "sink_bt")
+AUDIO_COMBINED: str = config["AudioCombiner"].get("COMB", "sink_combined")
+AUDIO_DESC1: str = config["AudioCombiner"].get("DESC1", "ASHA_Sink")
+AUDIO_DESC2: str = config["AudioCombiner"].get("DESC2", "BT_Sink")
+AUDIO_DESC3: str = config["AudioCombiner"].get("DESC3", "Combined_Sink")
+AUDIO_TARGET1: str = config["AudioCombiner"].get("TARGET1", os.environ.get('ASHA_SINK', 'asha_16450405641617933895'))
+AUDIO_TARGET2: str = config["AudioCombiner"].get("TARGET2", os.environ.get('BT_SINK', 'bluez_output.XX_XX_XX_XX_XX_XX.1'))
+AUDIO_LAT1: int = config["AudioCombiner"].get("LAT1", int(os.environ.get('ASHA_LAT', '34')))
+AUDIO_LAT2: int = config["AudioCombiner"].get("LAT2", int(os.environ.get('BT_LAT', '0')))
+AUDIO_CHAN1: str = config["AudioCombiner"].get("CHAN1", "both")
+AUDIO_CHAN2: str = config["AudioCombiner"].get("CHAN2", "both")
+AUDIO_AUTO_ADJUST: bool = config["AudioCombiner"].get("Auto_Adjust", True)
+AUDIO_MONITOR_INTERVAL: float = config["AudioCombiner"].get("Monitor_Interval", 1.0)
+
+'''
+WARNING!
+DO NOT USE EASYEFFECT WITH THIS IT WILL BREAK
+
+
+also it ONLY STREAMS TO DOUBLE CHANNEL BY DEFAULT using with left or right automatically will not work properly for BT devices
+you can try use pwvucontrol software to control the channel
+You can run this in background
+'''
+
+# Check environment variables for GTK UI
+ENV_GTK_UI = os.getenv('GTK_UI', '').lower() in ['1', 'true', 'yes', 'on']
 
 # Validate configuration
 if not PRIMARY_DEVICES and not SECONDARY_DEVICES:
@@ -326,8 +414,14 @@ if SECONDARY_DEVICES:
 log_info(f"Max simultaneous devices: {MAX_DEVICES}")
 if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
 	log_info(f"Secondary reconnection: {SECONDARY_RECONNECTION_MODE} mode (initial: {SECONDARY_INITIAL_DELAY}s, max: {SECONDARY_MAX_DELAY}s)")
+if CONNECTION_DELAY_ENABLED:
+	log_info(f"Connection delay: {CONNECTION_DELAY_SECONDS}s (only after both: {DELAY_ONLY_AFTER_BOTH}, apply to: {DELAY_APPLY_TO})", Fore.CYAN)
+if AUDIO_COMBINER_ENABLED:
+	log_info(f"Audio combiner enabled: {AUDIO_SINK1}+{AUDIO_SINK2} -> {AUDIO_COMBINED} (latencies: {AUDIO_LAT1}ms/{AUDIO_LAT2}ms)", Fore.MAGENTA)
+	if AUDIO_GTK_UI_ENABLED or ENV_GTK_UI:
+		log_info(f"GTK UI enabled for audio combiner", Fore.CYAN)
 
-# GATT Configuration - NEW: Separate UUID for secondary devices
+# GATT Configuration - Separate UUID for secondary devices
 GATT_ATTRIBUTE: str = config["GATT"]["Volume"]["ID"] or "00e4ca9e-ab14-41e4-8823-f9e70c7e91df"
 GATT_ATTRIBUTE_SEC: str = config["GATT"]["Volume_Sec"]["ID"] or "00e4ca9e-ab14-41e4-8823-f9e70c7e91df"
 PER_DEVICE_VOLUME: bool = config["GATT"].get("Per_Device_Volume", True)
@@ -372,8 +466,25 @@ asha_started: bool = False
 primary_connection_in_progress = threading.Event()
 secondary_connection_in_progress = threading.Event()
 
-# NEW: Secondary device reconnection tracking
+# Secondary device reconnection tracking
 secondary_reconnection_attempts: Dict[str, Dict[str, Any]] = {}  # mac -> {attempts: int, next_delay: float, last_attempt: float}
+
+# Connection delay tracking
+connection_delay_active = threading.Event()
+connection_delay_start_time = 0.0
+connection_delay_timer: Optional[threading.Timer] = None
+
+# Audio combiner state
+audio_combiner_started = threading.Event()
+audio_combiner_thread: Optional[threading.Thread] = None
+audio_combiner_stop = threading.Event()
+audio_combiner_manager: Optional[Any] = None
+
+# GTK UI state
+gtk_ui_thread: Optional[threading.Thread] = None
+gtk_ui_stop = threading.Event()
+gtk_window = None
+gtk_latency_queue = queue.Queue()
 
 # ------------------------------
 # ASYNC EVENT LOOP MANAGEMENT
@@ -427,8 +538,656 @@ class AsyncEventLoopManager:
 async_manager = AsyncEventLoopManager()
 
 # ------------------------------
+# AUDIO COMBINER CLASSES
+# ------------------------------
+class Sink:
+	__slots__ = ('name','target','desc','channel','latency','loopback_id','module_id','orig_volume')
+	def __init__(self, name: str, target: str, desc: str, channel: str = 'both', latency: int = 0):
+		self.name = name
+		self.target = target
+		self.desc = desc
+		self.channel = channel
+		self.latency = int(latency)
+		self.loopback_id: Optional[str] = None
+		self.module_id: Optional[str] = None
+		self.orig_volume: Optional[str] = None
+
+	def create_null_sink(self) -> Optional[str]:
+		if self.module_id:
+			log_debug("Null sink already created: %s", self.name)
+			return self.module_id
+		module_id = run_cmd([
+			'pactl', 'load-module', 'module-null-sink',
+			f'sink_name={self.name}', f'sink_properties=device.description={self.desc}'
+		], capture=True)
+		if module_id:
+			self.module_id = module_id
+			log_audio(f"Created null sink {self.name} (module {module_id})")
+		else:
+			log_error(f"Failed to create null sink {self.name}")
+		return self.module_id
+
+	def _build_loopback_cmd(self) -> List[str]:
+		mapping = ''
+		if self.channel == 'left':
+			mapping = 'channel_map=front-left,front-left'
+		elif self.channel == 'right':
+			mapping = 'channel_map=front-right,front-right'
+		cmd = [
+			'pactl', 'load-module', 'module-loopback',
+			f'source={self.name}.monitor',
+			f'sink={self.target}',
+			f'latency_msec={self.latency}',
+			'volume=0x10000'
+		]
+		if mapping:
+			cmd.append(mapping)
+		return cmd
+
+	def create_loopback(self) -> Optional[str]:
+		if self.loopback_id:
+			log_debug("Loopback already present for %s (%s), cleaning up before recreate", self.name, self.loopback_id)
+			self.cleanup_loopback()
+		module_id = run_cmd(self._build_loopback_cmd(), capture=True)
+		if module_id:
+			self.loopback_id = module_id
+			log_audio(f"Created loopback {self.name} -> {self.target} (module {module_id}) latency={self.latency}ms")
+		else:
+			log_error(f"Failed to create loopback for {self.name} -> {self.target}")
+		return self.loopback_id
+
+	def cleanup_loopback(self) -> None:
+		if not self.loopback_id:
+			return
+		for attempt in range(3):
+			run_cmd(['pactl', 'unload-module', self.loopback_id], check=False)
+			time.sleep(0.05 * (attempt + 1))
+			modules = run_cmd(['pactl', 'list', 'short', 'modules'], capture=True)
+			if not modules or self.loopback_id not in modules:
+				break
+			log_debug("Loopback %s still present after attempt %d", self.loopback_id, attempt + 1)
+		else:
+			log_warning("Loopback %s could not be removed after retries", self.loopback_id)
+		self.loopback_id = None
+
+	def get_volume(self) -> str:
+		out = run_cmd(['pactl', 'get-sink-volume', self.target], capture=True)
+		if not out:
+			self.orig_volume = '100%'
+			return self.orig_volume
+		for line in out.splitlines():
+			if 'Volume:' in line:
+				for tok in reversed(line.split()):
+					if tok.endswith('%'):
+						self.orig_volume = tok
+						return self.orig_volume
+		self.orig_volume = '100%'
+		return self.orig_volume
+
+	def set_volume(self, vol: str) -> None:
+		if not vol:
+			return
+		run_cmd(['pactl', 'set-sink-volume', self.target, vol], check=False)
+
+	def cleanup(self) -> None:
+		try:
+			self.cleanup_loopback()
+		except Exception as e:
+			log_debug("cleanup_loopback error: %s", e)
+		if self.module_id:
+			run_cmd(['pactl', 'unload-module', self.module_id], check=False)
+			self.module_id = None
+		if self.orig_volume:
+			try:
+				self.set_volume(self.orig_volume)
+			except Exception:
+				log_warning(f"Could not restore volume for {self.target}")
+
+class CombinedSink:
+	__slots__ = ('name','slaves','desc','module_id')
+	def __init__(self, name: str, slaves: List[str], desc: str):
+		self.name = name
+		self.slaves = list(slaves)
+		self.desc = desc
+		self.module_id: Optional[str] = None
+
+	def create(self, volume: Optional[str] = None) -> Optional[str]:
+		self.module_id = run_cmd([
+			'pactl', 'load-module', 'module-combine-sink',
+			f'sink_name={self.name}',
+			f'slaves={",".join(self.slaves)}',
+			f'sink_properties=device.description={self.desc}'
+		], capture=True)
+		if self.module_id:
+			run_cmd(['pactl', 'set-default-sink', self.name], check=False)
+			if volume:
+				run_cmd(['pactl', 'set-sink-volume', self.name, volume], check=False)
+			log_audio(f"Created combined sink {self.name} (module {self.module_id})")
+		else:
+			log_error(f"Failed to create combined sink {self.name}")
+		return self.module_id
+
+	def update_slaves(self, new_slaves: List[str]) -> None:
+		self.slaves = list(new_slaves)
+		run_cmd(['pactl', 'set-sink-slaves', self.name, ','.join(self.slaves)], check=False)
+		log_debug(f"Updated combined sink {self.name} slaves -> {self.slaves}")
+
+	def cleanup(self) -> None:
+		if self.module_id:
+			run_cmd(['pactl', 'unload-module', self.module_id], check=False)
+			self.module_id = None
+
+class AudioCombinerManager:
+	"""Manages audio sink combining for ASHA and BT devices"""
+	
+	def __init__(self, config: Dict[str, Any]):
+		self.config = config
+		# Get latencies from config (not from environment at this point)
+		lat1 = config.get('LAT1', AUDIO_LAT1)
+		lat2 = config.get('LAT2', AUDIO_LAT2)
+		
+		self.sink1 = Sink(
+			config['SINK1'], 
+			config['TARGET1'], 
+			config['DESC1'], 
+			config.get('CHAN1', 'both'), 
+			int(lat1)
+		)
+		self.sink2 = Sink(
+			config['SINK2'], 
+			config['TARGET2'], 
+			config['DESC2'], 
+			config.get('CHAN2', 'both'), 
+			int(lat2)
+		)
+		self.comb_sink = CombinedSink(
+			config['COMB'], 
+			[self.sink1.name, self.sink2.name], 
+			config['DESC3']
+		)
+		self._cached_sinks: Set[str] = set()
+		self.monitor_thread: Optional[threading.Thread] = None
+		self._last_config_lat1 = lat1
+		self._last_config_lat2 = lat2
+		
+	def _refresh_sink_cache(self) -> Set[str]:
+		"""Refresh cache of available audio sinks"""
+		out = run_cmd(['pactl', 'list', 'short', 'sinks'], capture=True)
+		current: Set[str] = set()
+		if out:
+			for line in out.splitlines():
+				parts = line.split()
+				if len(parts) >= 2:
+					current.add(parts[1])
+		self._cached_sinks = current
+		# log_debug(f"Refreshed sink cache: {current}")
+		return current
+	
+	def wait_for_sink_target(self, target: str, timeout: float = 30.0) -> bool:
+		"""Wait for a specific audio sink to become available"""
+		deadline = time.monotonic() + timeout
+		sinks = self._refresh_sink_cache()
+		if target in sinks:
+			return True
+		
+		log_audio(f"Waiting for sink {target}...")
+		while time.monotonic() < deadline and not audio_combiner_stop.is_set():
+			sinks = self._refresh_sink_cache()
+			if target in sinks:
+				log_audio(f"Sink {target} detected")
+				return True
+			time.sleep(0.5)
+		
+		log_warning(f"Timeout waiting for sink {target}")
+		return False
+	
+	def cleanup_zombie_modules(self) -> None:
+		"""Clean up any zombie audio modules"""
+		modules = run_cmd(['pactl', 'list', 'short', 'modules'], capture=True)
+		if not modules:
+			return
+		current_loopbacks = {self.sink1.loopback_id, self.sink2.loopback_id}
+		for line in modules.splitlines():
+			if 'module-loopback' in line:
+				parts = line.split()
+				if not parts:
+					continue
+				module_id = parts[0]
+				if module_id in current_loopbacks:
+					continue
+				if self.sink1.name in line or self.sink2.name in line:
+					log_warning(f"Unloading zombie loopback module {module_id}")
+					run_cmd(['pactl', 'unload-module', module_id], check=False)
+					time.sleep(0.02)
+	
+	def monitor_loop(self) -> None:
+		"""Monitor audio sinks and adjust as needed"""
+		log_audio("Starting audio combiner monitor loop (session-only latencies)")
+		self._refresh_sink_cache()
+		
+		while not audio_combiner_stop.is_set():
+			try:
+				# Check if both sinks are still available
+				sinks = self._refresh_sink_cache()
+				
+				# Handle ASHA sink removal
+				if self.sink1.target in sinks and not self.sink1.loopback_id:
+					self.sink1.create_loopback()
+					slaves = [self.sink1.name] + ([self.sink2.name] if self.sink2.loopback_id else [])
+					self.comb_sink.update_slaves(slaves)
+				
+				# Handle BT sink removal/addition
+				if self.sink2.target in sinks and not self.sink2.loopback_id:
+					self.sink2.create_loopback()
+					self.comb_sink.update_slaves([self.sink1.name, self.sink2.name])
+				
+				# Check for latency updates from GTK UI (session-only)
+				try:
+					while not gtk_latency_queue.empty():
+						lat1, lat2 = gtk_latency_queue.get_nowait()
+						log_audio(f"Received latency update from GTK UI (session-only): {lat1}ms, {lat2}ms")
+						self.set_latencies(lat1, lat2)
+				except queue.Empty:
+					pass
+				
+				# Clean up zombies periodically
+				if time.monotonic() % 10 < 1:  # Every ~10 seconds
+					self.cleanup_zombie_modules()
+				
+				time.sleep(self.config.get('Monitor_Interval', 1.0))
+				
+			except Exception as e:
+				log_error(f"Audio monitor error: {e}")
+				time.sleep(2.0)
+	
+	def set_latencies(self, lat1_ms: int, lat2_ms: int, force_update: bool = True) -> None:
+		"""Update audio sink latencies without saving to config file"""
+		# Only update if values actually changed
+		if self.sink1.latency == lat1_ms and self.sink2.latency == lat2_ms and not force_update:
+			log_debug("Latencies unchanged, skipping update")
+			return
+			
+		log_audio(f"Updating latencies: sink1={lat1_ms}ms sink2={lat2_ms}ms (session only)")
+		
+		# Store the new values
+		self.sink1.latency = int(lat1_ms)
+		self.sink2.latency = int(lat2_ms)
+		
+		# DO NOT update config dictionary - session only
+		# DO NOT call save_config()
+		
+		# Update environment variables for current session
+		os.environ['ASHA_LAT'] = str(lat1_ms)
+		os.environ['BT_LAT'] = str(lat2_ms)
+		
+		# Only recreate loopbacks if they exist
+		if self.sink1.loopback_id:
+			self.sink1.cleanup_loopback()
+			self.sink1.create_loopback()
+		
+		if self.sink2.loopback_id:
+			self.sink2.cleanup_loopback()
+			self.sink2.create_loopback()
+		
+		# Update combined sink slaves if it exists
+		if self.comb_sink.module_id:
+			slaves = [self.sink1.name] + ([self.sink2.name] if self.sink2.loopback_id else [])
+			self.comb_sink.update_slaves(slaves)
+	
+	def get_latencies(self) -> Tuple[int, int]:
+		"""Get current latencies"""
+		return self.sink1.latency, self.sink2.latency
+	
+	def start(self) -> bool:
+		"""Start the audio combiner"""
+		try:
+			log_audio("Starting audio combiner (GTK UI changes are session-only)...")
+			
+			# Get original default sink
+			orig_default_sink = run_cmd(['pactl', 'get-default-sink'], capture=True) or ''
+			
+			# Wait for sinks to be available
+			if not self.wait_for_sink_target(self.sink1.target, timeout=20.0):
+				log_warning(f"ASHA sink {self.sink1.target} not found")
+				return False
+			
+			if not self.wait_for_sink_target(self.sink2.target, timeout=20.0):
+				log_warning(f"BT sink {self.sink2.target} not found (may connect later)")
+			
+			# Get original volumes
+			vol1 = self.sink1.get_volume()
+			vol2 = self.sink2.get_volume()
+
+			self.sink1.set_volume('0')
+			self.sink2.set_volume('0')
+
+			# Create null sinks
+			self.sink1.create_null_sink()
+			self.sink2.create_null_sink()
+			
+			# Create loopbacks
+			self.sink1.create_loopback()
+			self.sink2.create_loopback()
+			
+			# Create combined sink
+			self.comb_sink.create(volume=vol1)
+			
+			# Set combined sink as default
+			run_cmd(['pactl', 'set-default-sink', self.comb_sink.name], check=False)
+			
+			# Restore volumes
+			self.sink1.set_volume('100%')
+			self.sink2.set_volume('100%')
+			
+			log_audio(f"Audio combiner ready. Original volumes: {vol1} / {vol2}")
+			log_audio(f"Original default sink: {orig_default_sink}")
+			log_audio("Note: GTK UI latency changes are session-only and will not persist")
+			
+			# Start monitor thread
+			self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+			self.monitor_thread.start()
+			
+			# Set global audio combiner manager
+			global audio_combiner_manager
+			audio_combiner_manager = self
+			
+			audio_combiner_started.set()
+			return True
+			
+		except Exception as e:
+			log_error(f"Failed to start audio combiner: {e}")
+			return False
+	
+	def stop(self) -> None:
+		"""Stop the audio combiner"""
+		log_audio("Stopping audio combiner...")
+		audio_combiner_stop.set()
+		
+		if self.monitor_thread and self.monitor_thread.is_alive():
+			self.monitor_thread.join(timeout=2.0)
+		
+		try:
+			self.cleanup_zombie_modules()
+		except Exception:
+			pass
+		
+		try:
+			self.comb_sink.cleanup()
+			self.sink1.cleanup()
+			self.sink2.cleanup()
+		except Exception as e:
+			log_debug(f"Cleanup exception: {e}")
+		
+		# Clear global reference
+		global audio_combiner_manager
+		audio_combiner_manager = None
+		
+		log_audio("Audio combiner stopped")
+
+# ------------------------------
+# GTK UI CLASS (GTK4 VERSION)
+# ------------------------------
+class GtkLatencyUI:
+    def __init__(self):
+        self.app = None
+        self.window = None
+        self.spin1 = None
+        self.spin2 = None
+        self.status_label = None
+        self.running = False
+
+    def run(self):
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk, GLib
+        
+        class LatencyApp(Gtk.Application):
+            def __init__(self):
+                super().__init__(application_id="org.example.latencyui")
+                self.window = None
+                self.spin1 = None
+                self.spin2 = None
+                self.status_label = None
+                
+            def do_activate(self):
+                # Create the main window
+                self.window = Gtk.ApplicationWindow(application=self)
+                self.window.set_title("Adjust Sink Latencies (ms) - Session Only")
+                self.window.set_default_size(400, 180)
+                self.window.set_resizable(True)
+                
+                # Main vertical box
+                vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+                vbox.set_margin_top(12)
+                vbox.set_margin_bottom(12)
+                vbox.set_margin_start(12)
+                vbox.set_margin_end(12)
+                self.window.set_child(vbox)
+                
+                # Create grid for controls
+                grid = Gtk.Grid()
+                grid.set_row_spacing(6)
+                grid.set_column_spacing(12)
+                grid.set_halign(Gtk.Align.CENTER)
+                vbox.append(grid)
+                
+                # Labels
+                label1 = Gtk.Label(label="Sink 1 (ASHA) latency (ms):")
+                label1.set_halign(Gtk.Align.START)
+                
+                label2 = Gtk.Label(label="Sink 2 (BT) latency (ms):")
+                label2.set_halign(Gtk.Align.START)
+                
+                # Spin buttons
+                self.spin1 = Gtk.SpinButton.new_with_range(0, 2000, 1)
+                self.spin1.set_value(AUDIO_LAT1)
+                self.spin1.set_hexpand(True)
+                
+                self.spin2 = Gtk.SpinButton.new_with_range(0, 2000, 1)
+                self.spin2.set_value(AUDIO_LAT2)
+                self.spin2.set_hexpand(True)
+                
+                # Status label
+                self.status_label = Gtk.Label(
+                    label=f"Current: ASHA={AUDIO_LAT1}ms, BT={AUDIO_LAT2}ms (session only)"
+                )
+                self.status_label.set_halign(Gtk.Align.CENTER)
+                
+                # Attach widgets to grid
+                grid.attach(label1, 0, 0, 1, 1)
+                grid.attach(self.spin1, 1, 0, 1, 1)
+                grid.attach(label2, 0, 1, 1, 1)
+                grid.attach(self.spin2, 1, 1, 1, 1)
+                grid.attach(self.status_label, 0, 2, 2, 1)
+                
+                # Button box
+                button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                button_box.set_halign(Gtk.Align.END)
+                button_box.set_margin_top(12)
+                vbox.append(button_box)
+                
+                # Buttons
+                reset_btn = Gtk.Button(label="Reset to defaults")
+                apply_btn = Gtk.Button(label="Apply (Session Only)")
+                close_btn = Gtk.Button(label="Close UI")
+                
+                reset_btn.connect("clicked", self.on_reset_to_defaults)
+                apply_btn.connect("clicked", self.on_apply)
+                close_btn.connect("clicked", self.on_close)
+                
+                button_box.append(reset_btn)
+                button_box.append(apply_btn)
+                button_box.append(close_btn)
+                
+                # Connect window close event
+                self.window.connect("close-request", self.on_close_request)
+                
+                # Present the window
+                self.window.present()
+                
+                # Store references in the outer class
+                ui.window = self.window
+                ui.spin1 = self.spin1
+                ui.spin2 = self.spin2
+                ui.status_label = self.status_label
+                ui.running = True
+                
+                # Start periodic update
+                GLib.timeout_add_seconds(2, self.update_latencies)
+                
+                # Check for stop signal
+                GLib.timeout_add(500, self.check_stop)
+            
+            def on_apply(self, btn):
+                if not self.spin1 or not self.spin2:
+                    return
+                lat1 = int(self.spin1.get_value())
+                lat2 = int(self.spin2.get_value())
+                gtk_latency_queue.put((lat1, lat2))
+                
+                os.environ["ASHA_LAT"] = str(lat1)
+                os.environ["BT_LAT"] = str(lat2)
+                
+                if self.status_label:
+                    self.status_label.set_label(
+                        f"Current: ASHA={lat1}ms, BT={lat2}ms (session only)"
+                    )
+            
+            def on_reset_to_defaults(self, btn):
+                if self.spin1:
+                    self.spin1.set_value(34)
+                if self.spin2:
+                    self.spin2.set_value(0)
+                self.on_apply(btn)
+            
+            def on_close(self, btn):
+                global gtk_ui_stop
+                gtk_ui_stop.set()
+                if self.window:
+                    self.window.close()
+            
+            def on_close_request(self, window):
+                global gtk_ui_stop
+                gtk_ui_stop.set()
+                return False  # Allow window to close
+            
+            def update_latencies(self):
+                if audio_combiner_manager and not gtk_ui_stop.is_set():
+                    try:
+                        lat1, lat2 = audio_combiner_manager.get_latencies()
+                        
+                        if self.spin1 and not self.spin1.has_focus():
+                            self.spin1.set_value(lat1)
+                        if self.spin2 and not self.spin2.has_focus():
+                            self.spin2.set_value(lat2)
+                        
+                        if self.status_label:
+                            self.status_label.set_label(
+                                f"Current: ASHA={lat1}ms, BT={lat2}ms (session only)"
+                            )
+                    except Exception as e:
+                        log_debug(f"Error updating latencies: {e}")
+                
+                return not gtk_ui_stop.is_set()  # Continue if not stopped
+            
+            def check_stop(self):
+                if gtk_ui_stop.is_set():
+                    if self.window:
+                        self.window.close()
+                    ui.running = False
+                    return False
+                return True
+        
+        # Create and run the application
+        ui = self
+        app = LatencyApp()
+        self.app = app
+        
+        # Run the application
+        app.run(None)
+
+
+def start_gtk_ui():
+    """Start GTK UI in a separate thread"""
+    global gtk_ui_thread
+    if gtk_ui_thread and gtk_ui_thread.is_alive():
+        log_gtk("GTK UI already running")
+        return
+    
+    gtk_ui_stop.clear()
+    gtk_ui_thread = threading.Thread(target=_gtk_ui_worker, daemon=True)
+    gtk_ui_thread.start()
+    log_gtk("GTK UI thread started")
+
+def _gtk_ui_worker():
+    """Worker function for GTK UI thread"""
+    # Set the GTK thread name for debugging
+    threading.current_thread().name = "GTK-UI-Thread"
+    
+    # Create and run the UI
+    gtk_ui = GtkLatencyUI()
+    try:
+        gtk_ui.run()
+    except Exception as e:
+        log_error(f"GTK UI error: {e}")
+    finally:
+        log_gtk("GTK UI thread exiting")
+
+def stop_gtk_ui():
+    """Stop GTK UI"""
+    global gtk_ui_thread
+    gtk_ui_stop.set()
+    if gtk_ui_thread and gtk_ui_thread.is_alive():
+        gtk_ui_thread.join(timeout=2.0)
+        gtk_ui_thread = None
+    log_gtk("GTK UI stopped")
+
+# ------------------------------
 # PROCESS MANAGEMENT UTILITIES
 # ------------------------------
+def run_cmd(cmd: List[str], capture: bool = False, check: bool = True, timeout: Optional[float] = None) -> Optional[str]:
+	"""Run a command and return output if requested"""
+	try:
+		if capture:
+			res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=check, timeout=timeout)
+			return res.stdout.strip()
+		else:
+			subprocess.run(cmd, check=check, timeout=timeout)
+			return None
+	except subprocess.CalledProcessError as e:
+		if capture:
+			log_debug(f"Command failed (capture): {' '.join(cmd)} -> {getattr(e, 'output', '')}")
+			return ""
+		log_warning(f"Command failed: {' '.join(cmd)}")
+		return None
+	except subprocess.TimeoutExpired:
+		log_warning(f"Command timeout: {' '.join(cmd)}")
+		return "" if capture else None
+
+def run_command(command: str, check: bool = True, capture_output: bool = False,
+				input_text: Optional[str] = None, cwd: Optional[str] = None,
+				debug: bool = True) -> Optional[str]:
+	"""Run a shell command and return output if requested"""
+	if debug and DEBUG:
+		log_debug(f"Running command: {command} [cwd={cwd}]")
+	try:
+		result = subprocess.run(
+			command,
+			shell=True,
+			check=check,
+			text=True,
+			capture_output=capture_output,
+			input=input_text,
+			cwd=cwd
+		)
+		return result.stdout.strip() if capture_output else None
+	except subprocess.CalledProcessError as e:
+		if debug:
+			log_error(f"Command error: {e}")
+		if capture_output and e.stdout:
+			return e.stdout.strip()
+		return None
+
 def is_asha_process_running() -> bool:
 	"""Check if ASHA sink process is already running"""
 	with global_lock:
@@ -465,30 +1224,6 @@ def kill_existing_asha_processes() -> None:
 # ------------------------------
 # UTILITY FUNCTIONS
 # ------------------------------
-def run_command(command: str, check: bool = True, capture_output: bool = False,
-				input_text: Optional[str] = None, cwd: Optional[str] = None,
-				debug: bool = True) -> Optional[str]:
-	"""Run a shell command and return output if requested"""
-	if debug and DEBUG:
-		log_debug(f"Running command: {command} [cwd={cwd}]")
-	try:
-		result = subprocess.run(
-			command,
-			shell=True,
-			check=check,
-			text=True,
-			capture_output=capture_output,
-			input=input_text,
-			cwd=cwd
-		)
-		return result.stdout.strip() if capture_output else None
-	except subprocess.CalledProcessError as e:
-		if debug:
-			log_error(f"Command error: {e}")
-		if capture_output and e.stdout:
-			return e.stdout.strip()
-		return None
-
 def run_trust_background(mac: str) -> None:
 	"""Launch `bluetoothctl trust <MAC>` in the background non-blocking"""
 	try:
@@ -532,6 +1267,120 @@ def disable_pairable_background() -> None:
 		)
 	except Exception as e:
 		log_warning(f"Failed to run bluetoothctl pairable off: {e}")
+
+# ------------------------------
+# CONNECTION DELAY MANAGER
+# ------------------------------
+class ConnectionDelayManager:
+	"""Manages connection delays after device connections"""
+	
+	def __init__(self):
+		self.delay_enabled = CONNECTION_DELAY_ENABLED
+		self.delay_seconds = CONNECTION_DELAY_SECONDS
+		self.only_after_both = DELAY_ONLY_AFTER_BOTH
+		self.apply_to = DELAY_APPLY_TO
+		self.reset_after_disconnect = DELAY_RESET_AFTER_DISCONNECT
+		
+	def should_apply_delay(self, device_type: str, device_manager) -> bool:
+		"""Check if delay should be applied for this connection"""
+		if not self.delay_enabled:
+			return False
+			
+		# Check if device type matches apply_to filter
+		if self.apply_to != "all":
+			if self.apply_to == "primary" and device_type != "primary":
+				return False
+			elif self.apply_to == "secondary" and device_type != "secondary":
+				return False
+		
+		# Check if we only apply delay after both devices are connected
+		if self.only_after_both:
+			# Get connection counts
+			primary_count = device_manager.get_connected_primary_count()
+			secondary_count = device_manager.get_connected_secondary_count()
+			
+			# Check if we have at least one of each type
+			has_both = primary_count >= 1 and secondary_count >= 1
+			
+			# If we don't have both types yet, no delay
+			if not has_both:
+				log_delay(f"No delay: don't have both device types yet (primary: {primary_count}, secondary: {secondary_count})")
+				return False
+		
+		# Check if delay is already active
+		if connection_delay_active.is_set():
+			log_delay(f"Delay already active, skipping additional delay")
+			return False
+			
+		return True
+	
+	def start_delay(self, device_type: str, device_manager):
+		"""Start a connection delay"""
+		if not self.should_apply_delay(device_type, device_manager):
+			return
+			
+		log_delay(f"Starting {self.delay_seconds}s connection delay after {device_type} device connection")
+		
+		# Set the delay active
+		connection_delay_active.set()
+		global connection_delay_start_time
+		connection_delay_start_time = time.time()
+		
+		# Create a timer to clear the delay
+		def clear_delay():
+			connection_delay_active.clear()
+			log_delay(f"Connection delay completed after {self.delay_seconds}s")
+		
+		global connection_delay_timer
+		if connection_delay_timer:
+			connection_delay_timer.cancel()
+		
+		connection_delay_timer = threading.Timer(self.delay_seconds, clear_delay)
+		connection_delay_timer.daemon = True
+		connection_delay_timer.start()
+	
+	def check_delay(self) -> bool:
+		"""Check if delay is currently active"""
+		if not self.delay_enabled:
+			return False
+			
+		return connection_delay_active.is_set()
+	
+	def get_remaining_delay(self) -> float:
+		"""Get remaining delay time in seconds"""
+		if not connection_delay_active.is_set():
+			return 0.0
+			
+		elapsed = time.time() - connection_delay_start_time
+		remaining = max(0, self.delay_seconds - elapsed)
+		return remaining
+	
+	def reset_delay(self):
+		"""Reset any active delay"""
+		if connection_delay_active.is_set():
+			connection_delay_active.clear()
+			global connection_delay_timer
+			if connection_delay_timer:
+				connection_delay_timer.cancel()
+				connection_delay_timer = None
+			log_delay("Connection delay reset")
+	
+	def handle_device_disconnect(self, device_type: str, device_manager):
+		"""Handle device disconnection for delay reset logic"""
+		if not self.delay_enabled or not self.reset_after_disconnect:
+			return
+			
+		# Check if we still have both device types
+		primary_count = device_manager.get_connected_primary_count()
+		secondary_count = device_manager.get_connected_secondary_count()
+		
+		# If we no longer have both types, reset delay
+		if self.only_after_both and not (primary_count >= 1 and secondary_count >= 1):
+			self.reset_delay()
+			log_delay(f"Delay reset: no longer have both device types (primary: {primary_count}, secondary: {secondary_count})")
+
+# Initialize connection delay manager
+connection_delay_manager = ConnectionDelayManager()
 
 # ------------------------------
 # SECONDARY DEVICE RECONNECTION MANAGER
@@ -759,8 +1608,9 @@ secondary_reconnection_manager = SecondaryReconnectionManager()
 # DEVICE MANAGEMENT CLASS
 # ------------------------------
 class DeviceManager:
-	def __init__(self):
+	def __init__(self, gtk_enabled: bool = False):
 		self.device_volumes: Dict[str, str] = {}  # mac -> volume value
+		self.gtk_enabled = gtk_enabled
 		
 	def get_device_volume(self, mac: str, default_volume: str) -> str:
 		"""Get volume for specific device, with fallback to default"""
@@ -779,6 +1629,12 @@ class DeviceManager:
 	
 	def can_connect_more(self) -> bool:
 		"""Check if we can connect more devices"""
+		# Check if connection delay is active
+		if connection_delay_manager.check_delay():
+			remaining = connection_delay_manager.get_remaining_delay()
+			log_delay(f"Connection delay active, {remaining:.1f}s remaining before allowing more connections")
+			return False
+			
 		return self.get_connected_count() < MAX_DEVICES
 	
 	def is_device_connected(self, mac: str) -> bool:
@@ -821,6 +1677,22 @@ class DeviceManager:
 			with global_lock:
 				if mac in secondary_reconnection_attempts:
 					del secondary_reconnection_attempts[mac]
+		
+		# Start connection delay if configured
+		connection_delay_manager.start_delay(device_type, self)
+		
+		# Start audio combiner if both devices are connected and feature is enabled
+		if (AUDIO_COMBINER_ENABLED and 
+			self.get_connected_primary_count() >= 1 and 
+			self.get_connected_secondary_count() >= 1 and
+			not audio_combiner_started.is_set()):
+			log_audio("Both devices connected, starting audio combiner")
+			self.start_audio_combiner()
+			
+			# Start GTK UI if enabled
+			if self.gtk_enabled and (AUDIO_GTK_UI_ENABLED or ENV_GTK_UI):
+				log_gtk("Starting GTK UI for audio combiner (session-only mode)")
+				start_gtk_ui()
 	
 	def remove_connected_device(self, mac: str, secondary_reconnect_enabled: bool = True) -> None:
 		"""Remove device from connected devices list"""
@@ -844,6 +1716,21 @@ class DeviceManager:
 				not shutdown_evt.is_set() and self.can_connect_more()):
 				log_reconnection(f"Secondary device {device_name} disconnected, starting reconnection process")
 				secondary_reconnection_manager.start_reconnection_attempt(mac, device_name, self, secondary_reconnect_enabled)
+		
+		# Handle delay reset on device disconnect
+		connection_delay_manager.handle_device_disconnect(device_type, self)
+		
+		# Stop audio combiner if we no longer have both devices
+		if (AUDIO_COMBINER_ENABLED and 
+			audio_combiner_started.is_set() and
+			not (self.get_connected_primary_count() >= 1 and self.get_connected_secondary_count() >= 1)):
+			log_audio("No longer have both devices, stopping audio combiner")
+			self.stop_audio_combiner()
+			
+			# Stop GTK UI if running
+			if self.gtk_enabled:
+				log_gtk("Stopping GTK UI (audio combiner stopped)")
+				stop_gtk_ui()
 	
 	def get_connected_devices_info(self) -> List[Tuple[str, str, str]]:
 		"""Get list of connected devices as (mac, name, type) tuples"""
@@ -911,10 +1798,55 @@ class DeviceManager:
 			status_parts.append(f"{secondary_count}/1 secondary")
 		
 		status_str = ", ".join(status_parts)
+		
+		# Add delay status if active
+		if connection_delay_manager.check_delay():
+			remaining = connection_delay_manager.get_remaining_delay()
+			status_str += f" (delay: {remaining:.1f}s)"
+			
+		# Add audio combiner status
+		if AUDIO_COMBINER_ENABLED:
+			if audio_combiner_started.is_set():
+				status_str += " [AUDIO COMBINED]"
+				if self.gtk_enabled and (AUDIO_GTK_UI_ENABLED or ENV_GTK_UI):
+					status_str += " [GTK UI - SESSION ONLY]"
+			
 		return f"{status_str} ({total_count}/{MAX_DEVICES} total)"
+	
+	def start_audio_combiner(self):
+		"""Start the audio combiner"""
+		global audio_combiner_thread
+		if audio_combiner_thread is None or not audio_combiner_thread.is_alive():
+			audio_combiner_stop.clear()
+			audio_combiner_thread = threading.Thread(
+				target=self._audio_combiner_worker,
+				daemon=True
+			)
+			audio_combiner_thread.start()
+	
+	def stop_audio_combiner(self):
+		"""Stop the audio combiner"""
+		audio_combiner_stop.set()
+		if audio_combiner_thread and audio_combiner_thread.is_alive():
+			audio_combiner_thread.join(timeout=2.0)
+		audio_combiner_started.clear()
+	
+	def _audio_combiner_worker(self):
+		"""Worker thread for audio combiner"""
+		try:
+			audio_combiner = AudioCombinerManager(config["AudioCombiner"])
+			if audio_combiner.start():
+				# Keep the thread alive while audio combiner is running
+				while not audio_combiner_stop.is_set():
+					time.sleep(1)
+				audio_combiner.stop()
+		except Exception as e:
+			log_error(f"Audio combiner worker error: {e}")
+			audio_combiner_started.clear()
 
-# Initialize device manager
-device_manager = DeviceManager()
+# Initialize device manager with GTK setting
+gtk_enabled = AUDIO_GTK_UI_ENABLED or ENV_GTK_UI
+device_manager = DeviceManager(gtk_enabled=gtk_enabled)
 
 # ------------------------------
 # ADVERTISEMENT MANAGEMENT
@@ -967,7 +1899,6 @@ class BluetoothAshaManager:
 		self.device_manager = device_manager
 		
 		# Determine secondary reconnection setting
-		# Command line argument overrides config setting
 		if hasattr(args, 'secondary_reconnect') and args.secondary_reconnect is not None:
 			self.secondary_reconnect_enabled = args.secondary_reconnect
 			log_info(f"Secondary reconnection {'enabled' if self.secondary_reconnect_enabled else 'disabled'} via command line", Fore.YELLOW)
@@ -989,6 +1920,45 @@ class BluetoothAshaManager:
 
 		# Determine operation mode
 		self.operation_mode = self._determine_operation_mode()
+		
+		# Connection delay command line override
+		if hasattr(args, 'connection_delay') and args.connection_delay is not None:
+			if args.connection_delay == 0:
+				connection_delay_manager.delay_enabled = False
+				log_info("Connection delay disabled via command line", Fore.YELLOW)
+			else:
+				connection_delay_manager.delay_enabled = True
+				connection_delay_manager.delay_seconds = args.connection_delay
+				log_info(f"Connection delay set to {args.connection_delay}s via command line", Fore.YELLOW)
+		
+		if hasattr(args, 'delay_only_after_both') and args.delay_only_after_both is not None:
+			connection_delay_manager.only_after_both = args.delay_only_after_both
+			log_info(f"Delay only after both: {args.delay_only_after_both}", Fore.YELLOW)
+		
+		# Audio combiner command line override
+		if hasattr(args, 'audio_combiner') and args.audio_combiner is not None:
+			global AUDIO_COMBINER_ENABLED
+			AUDIO_COMBINER_ENABLED = args.audio_combiner
+			log_info(f"Audio combiner {'enabled' if AUDIO_COMBINER_ENABLED else 'disabled'} via command line", Fore.MAGENTA)
+		
+		if hasattr(args, 'lat1') and args.lat1 is not None:
+			global AUDIO_LAT1
+			AUDIO_LAT1 = args.lat1
+			log_info(f"Audio latency 1 set to {AUDIO_LAT1}ms via command line", Fore.MAGENTA)
+		
+		if hasattr(args, 'lat2') and args.lat2 is not None:
+			global AUDIO_LAT2
+			AUDIO_LAT2 = args.lat2
+			log_info(f"Audio latency 2 set to {AUDIO_LAT2}ms via command line", Fore.MAGENTA)
+		
+		# GTK UI command line override
+		if hasattr(args, 'gtk_ui') and args.gtk_ui is not None:
+			global AUDIO_GTK_UI_ENABLED
+			AUDIO_GTK_UI_ENABLED = args.gtk_ui
+			log_info(f"GTK UI {'enabled' if AUDIO_GTK_UI_ENABLED else 'disabled'} via command line", Fore.CYAN)
+		
+		# Update device manager with new GTK setting
+		device_manager.gtk_enabled = AUDIO_GTK_UI_ENABLED or ENV_GTK_UI
 		
 	def _determine_operation_mode(self) -> Optional[str]:
 		"""Determine operation mode from environment variables and command line arguments"""
@@ -1299,6 +2269,14 @@ class BluetoothAshaManager:
 
 		log_device(f"New device detected: {name} ({mac})", device_type)
 		
+		# Check if connection delay is active
+		if connection_delay_manager.check_delay():
+			remaining = connection_delay_manager.get_remaining_delay()
+			log_delay(f"Connection delay active, skipping {name} for {remaining:.1f}s")
+			with global_lock:
+				processed_devices.discard(mac)
+			return
+		
 		# Use thread-safe async execution
 		try:
 			future = async_manager.run_coroutine_threadsafe(self.async_connect_specific(mac, device_type))
@@ -1316,7 +2294,7 @@ class BluetoothAshaManager:
 			actual_device_type = self.device_manager.get_device_type(name)
 			log_device(f"Connected to {name} ({mac})!", actual_device_type)
 			
-			# NEW: Immediately execute GATT operations for secondary devices after connection
+			# Immediately execute GATT operations for secondary devices after connection
 			if actual_device_type == "secondary":
 				log_gatt(f"Executing immediate GATT operations for secondary device {name}")
 				# Use a small delay to ensure the connection is stable
@@ -1775,7 +2753,7 @@ exit
 		# Get device-specific volume or use default
 		volume_value = self.device_manager.get_device_volume(mac_address, self.volume_value)
 		
-		# NEW: Use different UUID for secondary devices
+		# Use different UUID for secondary devices
 		if device_type == "secondary":
 			gatt_uuid = GATT_ATTRIBUTE_SEC
 			log_gatt(f"Using secondary UUID for {device_name}: {gatt_uuid}")
@@ -1913,6 +2891,17 @@ exit
 		# Stop all secondary reconnection attempts
 		secondary_reconnection_manager.stop_all_reconnections()
 		
+		# Reset any active connection delay
+		connection_delay_manager.reset_delay()
+		
+		# Stop GTK UI if running
+		if device_manager.gtk_enabled:
+			stop_gtk_ui()
+		
+		# Stop audio combiner if running
+		if audio_combiner_started.is_set():
+			device_manager.stop_audio_combiner()
+		
 		if self.args.disconnect:
 			run_command("bluetoothctl agent off", check=False)
 			run_command("bluetoothctl power off", check=False)
@@ -2030,7 +3019,7 @@ exit
 def main() -> None:
 	global MAX_DEVICES, PRIORITY_PRIMARY
 	
-	parser = argparse.ArgumentParser(description="Bluetooth ASHA Manager")
+	parser = argparse.ArgumentParser(description="Bluetooth ASHA Manager with Audio Sink Combining")
 	parser.add_argument('-c', '--clean-state', action='store_true',
 						help='Skip automatic GATT operations on state change')
 	parser.add_argument('-r', '--reconnect', action='store_true',
@@ -2054,11 +3043,33 @@ def main() -> None:
 	parser.add_argument('-so','--secondary-only', action='store_true',
 						help="Only connect to secondary devices (overrides config and environment(SEC_O))")
 	
-	# NEW: Secondary reconnection argument
+	# Secondary reconnection argument
 	parser.add_argument('-sr', '--secondary-reconnect', action='store_true', default=None,
 						help='Enable background reconnection for secondary devices without restarting Bluetooth (overrides config)')
 	parser.add_argument('-nsr', '--no-secondary-reconnect', action='store_false', dest='secondary_reconnect',
 						help='Disable background reconnection for secondary devices (overrides config)')
+	
+	# Connection delay arguments
+	parser.add_argument('-cd', '--connection-delay', type=float, default=None,
+						help='Connection delay in seconds after device connects (0 to disable, overrides config)')
+	parser.add_argument('-dob', '--delay-only-after-both', action='store_true', default=None,
+						help='Only apply connection delay after both primary and secondary are connected')
+	
+	# Audio combiner arguments
+	parser.add_argument('-ac', '--audio-combiner', action='store_true', default=None,
+						help='Enable audio sink combiner for ASHA and BT devices (overrides config)')
+	parser.add_argument('-nac', '--no-audio-combiner', action='store_false', dest='audio_combiner',
+						help='Disable audio sink combiner (overrides config)')
+	parser.add_argument('-lat1', '--lat1', type=int, default=None,
+						help='Audio latency for ASHA sink in milliseconds (overrides config)')
+	parser.add_argument('-lat2', '--lat2', type=int, default=None,
+						help='Audio latency for BT sink in milliseconds (overrides config)')
+	
+	# GTK UI arguments
+	parser.add_argument('-gtk', '--gtk-ui', action='store_true', default=None,
+						help='Enable GTK UI for adjusting audio latencies (overrides config)')
+	parser.add_argument('-ngtk', '--no-gtk-ui', action='store_false', dest='gtk_ui',
+						help='Disable GTK UI (overrides config)')
 	
 	args = parser.parse_args()
 
@@ -2075,4 +3086,3 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
-
