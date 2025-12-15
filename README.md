@@ -22,6 +22,7 @@ i might want to add timer so it will repeatly request for initial handshake unti
 If the audio is choppy, delayed, or sounds like it is shifting from ear to ear, then your adapter may not be able to keep up with the bandwidth requirements.
 Try connecting a single device and see if the quality improves or restart this program it usually fixes for me.
 
+using niceness values can improve the slience when high CPU utilizations, intel user may benefit from this thanks to their crazy overclocking capabilities
 
 -c to remove that GATT trigger to FF i may want to let user to choose and override that set under config, you can use it to control the volume rather controlling them through the desktop. Using that volume control on your desktop can cause lower audio quality you not going to like it
 it ranges from 80 to FF
