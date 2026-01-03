@@ -86,6 +86,7 @@ Usually, if connection return try to restart this device and try to rerun the sc
 """
 This script aims to assist all annonying G.722 bluetooth connection issues 
 """
+
 # ==============
 #  DEPENDENCIES
 # ==============
@@ -273,14 +274,17 @@ def load_config(config_path: str) -> dict:
 				"DESC1": "ASHA_Sink",
 				"DESC2": "BT_Sink",
 				"DESC3": "Combined_Sink",
-				"TARGET1": os.environ.get('ASHA_SINK', 'asha_16450405641617933895'),  # dont forget to update this
-				"TARGET2": os.environ.get('BT_SINK', 'bluez_output.XX_XX_XX_XX_XX_XX.1'), # dont forget to update this Do use  "pactl list short sinks" to find the proper sink name (its persistent)
-				"LAT1": 34,  # Default value from config, completely separate from GTK UI
-				"LAT2": 0,   # Default value from config, completely separate from GTK UI
-				"CHAN1": "both",  # "left", "right", "both"
-				"CHAN2": "both",  # "left", "right", "both"
+				"TARGET1": os.environ.get('ASHA_SINK', 'asha_16450405641617933895'),
+				"TARGET2": os.environ.get('BT_SINK', 'bluez_output.XX_XX_XX_XX_XX_XX.1'),
+				"LAT1": 34,
+				"LAT2": 0,
+				"CHAN1": "both",
+				"CHAN2": "both",
 				"Auto_Adjust": True,
 				"Monitor_Interval": 1.0
+			},
+			"GTK_UI": {
+				"Keep_On_Reconnect": False,
 			},
 			"Blacklist": [
 				"AudioStream Adapter DFU",
@@ -342,6 +346,40 @@ def save_config():
 CONFIG_PATH = os.path.expanduser(config_path)
 config = load_config(CONFIG_PATH)
 
+# ------------------------------
+# ENVIRONMENT VARIABLES (Highest Priority - Level 1)
+# ------------------------------
+# Clean environment variable logging
+ENV_OVERRIDES = [
+	"LND",
+	"ASHA_LAT", 
+	"BT_LAT",
+	"GTK_UI",
+	"R_GTK_UI",
+	"PRI_O",
+	"SEC_O",
+]
+
+# Log environment variable overrides
+log_info("=== ENVIRONMENT VARIABLES (Highest Priority) ===", Fore.YELLOW)
+for var in ENV_OVERRIDES:
+	value = os.getenv(var)
+	if value is not None:
+		log_info(f"Environment variable {var}={value} will override config/CLI", Fore.YELLOW)
+
+# Environment variable values
+ENV_VOLUME = os.getenv("LND")
+ENV_LAT1 = os.environ.get('ASHA_LAT')
+ENV_LAT2 = os.environ.get('BT_LAT')
+ENV_GTK_UI = os.getenv('GTK_UI', '').lower() in ['1', 'true', 'yes', 'on']
+ENV_R_GTK_UI = os.getenv('R_GTK_UI', '').lower() in ['1', 'true', 'yes', 'on']
+ENV_PRIMARY_ONLY = os.getenv("PRI_O", '').lower() in ['1', 'true', 'yes', 'on']
+ENV_SECONDARY_ONLY = os.getenv("SEC_O", '').lower() in ['1', 'true', 'yes', 'on']
+ENV_DEBUG = os.getenv('DEBUG', '0') == '1'
+
+# ------------------------------
+# CONFIG FILE VALUES (Lowest Priority - Level 3)
+# ------------------------------
 # Extract device lists from config
 PRIMARY_DEVICES: List[str] = config["Devices"].get("Primary", [])
 SECONDARY_DEVICES: List[str] = config["Devices"].get("Secondary", [])
@@ -360,10 +398,10 @@ SECONDARY_BACKOFF_MULTIPLIER: float = config["Reconnection"]["Secondary"].get("B
 CONNECTION_DELAY_ENABLED: bool = config["Connection_Delay"].get("Enabled", False)
 CONNECTION_DELAY_SECONDS: float = config["Connection_Delay"].get("Delay_Seconds", 5.0)
 DELAY_ONLY_AFTER_BOTH: bool = config["Connection_Delay"].get("Only_After_Both", True)
-DELAY_APPLY_TO: str = config["Connection_Delay"].get("Apply_To", "all")  # "all", "primary", "secondary"
+DELAY_APPLY_TO: str = config["Connection_Delay"].get("Apply_To", "all")
 DELAY_RESET_AFTER_DISCONNECT: bool = config["Connection_Delay"].get("Reset_After_Disconnect", True)
 
-# Extract audio combiner settings - get from config only
+# Extract audio combiner settings
 AUDIO_COMBINER_ENABLED: bool = config["AudioCombiner"].get("Enabled", False)
 AUDIO_GTK_UI_ENABLED: bool = config["AudioCombiner"].get("GTK_UI", False)
 AUDIO_SINK1: str = config["AudioCombiner"].get("SINK1", "sink_asha")
@@ -375,88 +413,14 @@ AUDIO_DESC3: str = config["AudioCombiner"].get("DESC3", "Combined_Sink")
 AUDIO_TARGET1: str = config["AudioCombiner"].get("TARGET1", os.environ.get('ASHA_SINK', 'asha_16450405641617933895'))
 AUDIO_TARGET2: str = config["AudioCombiner"].get("TARGET2", os.environ.get('BT_SINK', 'bluez_output.XX_XX_XX_XX_XX_XX.1'))
 
-# Get CONFIG latencies - these are separate from GTK UI values
-CONFIG_LAT1: int = config["AudioCombiner"].get("LAT1", 34)  # From config file only
-CONFIG_LAT2: int = config["AudioCombiner"].get("LAT2", 0)   # From config file only
+# Get CONFIG latencies
+CONFIG_LAT1: int = config["AudioCombiner"].get("LAT1", 34)
+CONFIG_LAT2: int = config["AudioCombiner"].get("LAT2", 0)
 
-# GTK UI values start as None - will be set when GTK UI starts
-GTK_UI_LAT1: Optional[int] = None
-GTK_UI_LAT2: Optional[int] = None
+# GTK UI survival setting from config
+KEEP_GTK_ON_RECONNECT: bool = config["GTK_UI"].get("Keep_On_Reconnect", False)
 
-# Initialize with config values for audio combiner startup
-AUDIO_LAT1: int = CONFIG_LAT1  # Initial value from config
-AUDIO_LAT2: int = CONFIG_LAT2  # Initial value from config
-
-# Store current active latencies (can be overridden by GTK UI later)
-current_lat1 = AUDIO_LAT1
-current_lat2 = AUDIO_LAT2
-
-# Command line environment variables can override initial values for this session
-env_lat1 = os.environ.get('ASHA_LAT')
-env_lat2 = os.environ.get('BT_LAT')
-
-if env_lat1:
-	try:
-		current_lat1 = int(env_lat1)
-		log_info(f"Using environment variable ASHA_LAT={current_lat1} for this session", Fore.YELLOW)
-	except ValueError:
-		log_warning(f"Invalid ASHA_LAT environment variable: {env_lat1}, using config value: {CONFIG_LAT1}")
-
-if env_lat2:
-	try:
-		current_lat2 = int(env_lat2)
-		log_info(f"Using environment variable BT_LAT={current_lat2} for this session", Fore.YELLOW)
-	except ValueError:
-		log_warning(f"Invalid BT_LAT environment variable: {env_lat2}, using config value: {CONFIG_LAT2}")
-
-# Update initial latencies
-AUDIO_LAT1 = current_lat1
-AUDIO_LAT2 = current_lat2
-
-AUDIO_CHAN1: str = config["AudioCombiner"].get("CHAN1", "both")
-AUDIO_CHAN2: str = config["AudioCombiner"].get("CHAN2", "both")
-AUDIO_AUTO_ADJUST: bool = config["AudioCombiner"].get("Auto_Adjust", True)
-AUDIO_MONITOR_INTERVAL: float = config["AudioCombiner"].get("Monitor_Interval", 1.0)
-
-'''
-WARNING!
-DO NOT USE EASYEFFECT WITH THIS IT WILL BREAK
-
-also it ONLY STREAMS TO DOUBLE CHANNEL BY DEFAULT using with left or right automatically will not work properly for BT devices
-you can try use pwvucontrol software to control the channel
-You can run this in background
-'''
-
-# Check environment variables for GTK UI
-ENV_GTK_UI = os.getenv('GTK_UI', '').lower() in ['1', 'true', 'yes', 'on']
-
-# Validate configuration
-if not PRIMARY_DEVICES and not SECONDARY_DEVICES:
-	raise RuntimeError("Error: No device names specified in config. Please configure at least one primary or secondary device.")
-
-# Create combined device filters for scanning
-ALL_DEVICE_FILTERS = PRIMARY_DEVICES + SECONDARY_DEVICES
-
-# Remove empty strings from device lists
-PRIMARY_DEVICES = [device for device in PRIMARY_DEVICES if device]
-SECONDARY_DEVICES = [device for device in SECONDARY_DEVICES if device]
-ALL_DEVICE_FILTERS = [device for device in ALL_DEVICE_FILTERS if device]
-
-# Log configuration summary
-log_info(f"Primary devices: {PRIMARY_DEVICES}")
-if SECONDARY_DEVICES:
-	log_info(f"Secondary devices: {SECONDARY_DEVICES}")
-log_info(f"Max simultaneous devices: {MAX_DEVICES}")
-if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
-	log_info(f"Secondary reconnection: {SECONDARY_RECONNECTION_MODE} mode (initial: {SECONDARY_INITIAL_DELAY}s, max: {SECONDARY_MAX_DELAY}s)")
-if CONNECTION_DELAY_ENABLED:
-	log_info(f"Connection delay: {CONNECTION_DELAY_SECONDS}s (only after both: {DELAY_ONLY_AFTER_BOTH}, apply to: {DELAY_APPLY_TO})", Fore.CYAN)
-if AUDIO_COMBINER_ENABLED:
-	log_info(f"Audio combiner enabled: {AUDIO_SINK1}+{AUDIO_SINK2} -> {AUDIO_COMBINED} (initial latencies: {AUDIO_LAT1}ms/{AUDIO_LAT2}ms)", Fore.MAGENTA)
-	if AUDIO_GTK_UI_ENABLED or ENV_GTK_UI:
-		log_info(f"GTK UI enabled for audio combiner", Fore.CYAN)
-
-# GATT Configuration - Separate UUID for secondary devices
+# GATT Configuration
 GATT_ATTRIBUTE: str = config["GATT"]["Volume"]["ID"] or "00e4ca9e-ab14-41e4-8823-f9e70c7e91df"
 GATT_ATTRIBUTE_SEC: str = config["GATT"]["Volume_Sec"]["ID"] or "00e4ca9e-ab14-41e4-8823-f9e70c7e91df"
 PER_DEVICE_VOLUME: bool = config["GATT"].get("Per_Device_Volume", True)
@@ -481,28 +445,294 @@ Timeout_qs: float = random.uniform(80000, 100000)
 BLACKLIST: list = config.get("Blacklist", [])
 
 # ------------------------------
+# COMMAND LINE ARGUMENTS (Middle Priority - Level 2)
+# ------------------------------
+# Create parser to get command line args for initial setup
+def create_parser():
+	"""Create argument parser for command line arguments"""
+	parser = argparse.ArgumentParser(description="Bluetooth ASHA Manager with Audio Sink Combining", 
+									add_help=False)  # Don't parse yet
+	parser.add_argument('-c', '--clean-state', action='store_true',
+						help='Skip automatic GATT operations on state change')
+	parser.add_argument('-r', '--reconnect', action='store_true',
+						help='Enable automatic ASHA restart if device disconnects')
+	parser.add_argument('-d', '--disconnect', action='store_true',
+						help='Disconnect Bluetooth devices on exit')
+	parser.add_argument('-p', '--pair', action='store_true',
+						help='Enable persistent pairing mode')
+	parser.add_argument('-da', '--disable-advertisement', action='store_true',
+						help='Disable Bluetooth LE advertising')
+	parser.add_argument('-rof','--reset-on-failure', action='store_true', 
+						help='Auto-reset adapter on ASHA connect failure')
+	parser.add_argument('-l', '--loudness', action='store_true',
+						help="Use configured GATT volume value")
+	parser.add_argument('-md', '--max-devices', type=int, default=None,
+						help=f"Maximum number of devices to connect simultaneously (default: {MAX_DEVICES})")
+	parser.add_argument('-pp', '--priority-primary', action='store_true', default=None,
+						help="Prioritize primary devices over secondary (default: from config)")
+	parser.add_argument('-po','--primary-only', action='store_true',
+						help="Only connect to primary devices")
+	parser.add_argument('-so','--secondary-only', action='store_true',
+						help="Only connect to secondary devices")
+	
+	# Secondary reconnection argument
+	parser.add_argument('-sr', '--secondary-reconnect', action='store_true', default=None,
+						help='Enable background reconnection for secondary devices without restarting Bluetooth')
+	parser.add_argument('-nsr', '--no-secondary-reconnect', action='store_false', dest='secondary_reconnect',
+						help='Disable background reconnection for secondary devices')
+	
+	# Connection delay arguments
+	parser.add_argument('-cd', '--connection-delay', type=float, default=None,
+						help='Connection delay in seconds after device connects (0 to disable)')
+	parser.add_argument('-dob', '--delay-only-after-both', action='store_true', default=None,
+						help='Only apply connection delay after both primary and secondary are connected')
+	
+	# Audio combiner arguments
+	parser.add_argument('-ac', '--audio-combiner', action='store_true', default=None,
+						help='Enable audio sink combiner for ASHA and BT devices')
+	parser.add_argument('-nac', '--no-audio-combiner', action='store_false', dest='audio_combiner',
+						help='Disable audio sink combiner')
+	parser.add_argument('-lat1', '--lat1', type=int, default=None,
+						help='Audio latency for ASHA sink in milliseconds')
+	parser.add_argument('-lat2', '--lat2', type=int, default=None,
+						help='Audio latency for BT sink in milliseconds')
+	
+	# GTK UI arguments
+	parser.add_argument('-gtk', '--gtk-ui', action='store_true', default=None,
+						help='Enable GTK UI for adjusting audio latencies')
+	parser.add_argument('-ngtk', '--no-gtk-ui', action='store_false', dest='gtk_ui',
+						help='Disable GTK UI')
+	
+	# GTK UI survival arguments
+	parser.add_argument('-kgtk', '--keep-gtk-on-reconnect', action='store_true', default=None,
+						help='Keep GTK UI alive during normal -r reconnection events')
+	parser.add_argument('-nkgtk', '--no-keep-gtk-on-reconnect', action='store_false', dest='keep_gtk_on_reconnect',
+						help='Allow GTK UI to be killed during reconnections')
+	
+	return parser
+
+# Parse command line arguments
+parser = create_parser()
+args, unknown = parser.parse_known_args()
+
+# ------------------------------
+# APPLY PRIORITY ORDER (Refactored)
+# ------------------------------
+log_info("=== APPLYING PRIORITY ORDER ===", Fore.CYAN)
+log_info("Priority: ENVIRONMENT → COMMAND LINE → CONFIG", Fore.CYAN)
+
+# Define all options with their ENV, CLI, and CONFIG sources
+CONFIG_OPTIONS = [
+	# (Global Var Name, ENV Key(s), CLI Attr Name, Config Default)
+	("FINAL_VOLUME_VALUE", "LND", "loudness", config["GATT"]["Volume"]["Value"]),
+	("FINAL_OPERATION_MODE", ("PRI_O", "SEC_O"), None, None),  # Special handling below
+	("FINAL_LAT1", "ASHA_LAT", "lat1", CONFIG_LAT1),
+	("FINAL_LAT2", "BT_LAT", "lat2", CONFIG_LAT2),
+	("FINAL_GTK_UI_ENABLED", "GTK_UI", "gtk_ui", AUDIO_GTK_UI_ENABLED),
+	("FINAL_KEEP_GTK_ON_RECONNECT", "R_GTK_UI", "keep_gtk_on_reconnect", KEEP_GTK_ON_RECONNECT),
+	("FINAL_AUDIO_COMBINER_ENABLED", None, "audio_combiner", AUDIO_COMBINER_ENABLED),
+	("FINAL_SECONDARY_RECONNECTION_ENABLED", None, "secondary_reconnect", SECONDARY_RECONNECTION_ENABLED),
+	("FINAL_CONNECTION_DELAY_ENABLED", None, "connection_delay", CONNECTION_DELAY_ENABLED),
+	("FINAL_CONNECTION_DELAY_SECONDS", None, "connection_delay", CONNECTION_DELAY_SECONDS),
+	("FINAL_DELAY_ONLY_AFTER_BOTH", None, "delay_only_after_both", DELAY_ONLY_AFTER_BOTH),
+	("FINAL_MAX_DEVICES", None, "max_devices", MAX_DEVICES),
+	("FINAL_PRIORITY_PRIMARY", None, "priority_primary", PRIORITY_PRIMARY),
+]
+
+FINAL_VALUES = {}
+
+def get_cli_value(attr_name):
+	"""Get CLI value with proper None handling"""
+	value = getattr(args, attr_name, None)
+	# For boolean flags that default to None, we need to distinguish between not set and False
+	if value is None and attr_name in ['gtk_ui', 'keep_gtk_on_reconnect', 'audio_combiner', 
+									  'secondary_reconnect', 'priority_primary']:
+		# These are boolean flags that can be explicitly set to False with -n* flags
+		# If not set at all, they remain None
+		return None
+	return value
+
+# Special handling for operation mode first
+if ENV_PRIMARY_ONLY:
+	FINAL_VALUES["FINAL_OPERATION_MODE"] = "primary_only"
+elif ENV_SECONDARY_ONLY:
+	FINAL_VALUES["FINAL_OPERATION_MODE"] = "secondary_only"
+elif args.primary_only:
+	FINAL_VALUES["FINAL_OPERATION_MODE"] = "primary_only"
+elif args.secondary_only:
+	FINAL_VALUES["FINAL_OPERATION_MODE"] = "secondary_only"
+else:
+	FINAL_VALUES["FINAL_OPERATION_MODE"] = None
+
+# Process other options
+for name, env_key, cli_attr, config_default in CONFIG_OPTIONS:
+	# Skip operation mode as already handled
+	if name == "FINAL_OPERATION_MODE":
+		continue
+		
+	value = None
+	
+	# Environment check
+	if env_key:
+		if isinstance(env_key, tuple):
+			# Special handling for multiple env vars (not used for these options)
+			pass
+		else:
+			env_val = os.getenv(env_key)
+			if env_val is not None:
+				# Type conversion based on config_default type
+				if isinstance(config_default, bool):
+					# Handle boolean env vars
+					value = env_val.lower() in ['1', 'true', 'yes', 'on']
+				elif isinstance(config_default, int):
+					try:
+						value = int(env_val)
+					except ValueError:
+						log_warning(f"Invalid integer value for {env_key}: {env_val}, using default")
+						value = config_default
+				else:
+					value = env_val
+	
+	# CLI fallback
+	if value is None and cli_attr:
+		cli_val = get_cli_value(cli_attr)
+		if cli_val is not None:
+			# Special handling for connection delay (single arg controls both enabled and seconds)
+			if cli_attr == "connection_delay":
+				# Store as tuple for later processing
+				value = cli_val
+			else:
+				value = cli_val
+	
+	# Config fallback
+	if value is None:
+		value = config_default
+		
+	# Special post-processing for certain values
+	if name == "FINAL_VOLUME_VALUE" and value is True:
+		# When --loudness is True, use config value
+		value = config["GATT"]["Volume"]["Value"]
+	elif name == "FINAL_CONNECTION_DELAY_ENABLED" and "FINAL_CONNECTION_DELAY_SECONDS" in FINAL_VALUES:
+		# Handle connection delay enabled/seconds logic
+		delay_val = FINAL_VALUES["FINAL_CONNECTION_DELAY_SECONDS"]
+		if isinstance(delay_val, (int, float)):
+			value = delay_val != 0
+		else:
+			value = config_default
+	elif name == "FINAL_CONNECTION_DELAY_SECONDS" and isinstance(value, (int, float)):
+		# Ensure delay seconds is positive if enabled
+		if value == 0:
+			value = CONNECTION_DELAY_SECONDS
+	
+	FINAL_VALUES[name] = value
+
+# Extract special cases
+FINAL_VOLUME_VALUE = FINAL_VALUES.get("FINAL_VOLUME_VALUE", config["GATT"]["Volume"]["Value"])
+FINAL_OPERATION_MODE = FINAL_VALUES.get("FINAL_OPERATION_MODE")
+FINAL_LAT1 = FINAL_VALUES.get("FINAL_LAT1", CONFIG_LAT1)
+FINAL_LAT2 = FINAL_VALUES.get("FINAL_LAT2", CONFIG_LAT2)
+FINAL_GTK_UI_ENABLED = FINAL_VALUES.get("FINAL_GTK_UI_ENABLED", AUDIO_GTK_UI_ENABLED)
+FINAL_KEEP_GTK_ON_RECONNECT = FINAL_VALUES.get("FINAL_KEEP_GTK_ON_RECONNECT", KEEP_GTK_ON_RECONNECT)
+FINAL_AUDIO_COMBINER_ENABLED = FINAL_VALUES.get("FINAL_AUDIO_COMBINER_ENABLED", AUDIO_COMBINER_ENABLED)
+FINAL_SECONDARY_RECONNECTION_ENABLED = FINAL_VALUES.get("FINAL_SECONDARY_RECONNECTION_ENABLED", SECONDARY_RECONNECTION_ENABLED)
+FINAL_CONNECTION_DELAY_ENABLED = FINAL_VALUES.get("FINAL_CONNECTION_DELAY_ENABLED", CONNECTION_DELAY_ENABLED)
+FINAL_CONNECTION_DELAY_SECONDS = FINAL_VALUES.get("FINAL_CONNECTION_DELAY_SECONDS", CONNECTION_DELAY_SECONDS)
+FINAL_DELAY_ONLY_AFTER_BOTH = FINAL_VALUES.get("FINAL_DELAY_ONLY_AFTER_BOTH", DELAY_ONLY_AFTER_BOTH)
+FINAL_MAX_DEVICES = FINAL_VALUES.get("FINAL_MAX_DEVICES", MAX_DEVICES)
+FINAL_PRIORITY_PRIMARY = FINAL_VALUES.get("FINAL_PRIORITY_PRIMARY", PRIORITY_PRIMARY)
+
+# Update global variables with final values
+MAX_DEVICES = FINAL_MAX_DEVICES
+PRIORITY_PRIMARY = FINAL_PRIORITY_PRIMARY
+SECONDARY_RECONNECTION_ENABLED = FINAL_SECONDARY_RECONNECTION_ENABLED
+CONNECTION_DELAY_ENABLED = FINAL_CONNECTION_DELAY_ENABLED
+CONNECTION_DELAY_SECONDS = FINAL_CONNECTION_DELAY_SECONDS
+DELAY_ONLY_AFTER_BOTH = FINAL_DELAY_ONLY_AFTER_BOTH
+AUDIO_COMBINER_ENABLED = FINAL_AUDIO_COMBINER_ENABLED
+AUDIO_GTK_UI_ENABLED = FINAL_GTK_UI_ENABLED
+AUDIO_LAT1 = FINAL_LAT1
+AUDIO_LAT2 = FINAL_LAT2
+KEEP_GTK_ON_RECONNECT = FINAL_KEEP_GTK_ON_RECONNECT
+
+# Initialize latencies from config
+AUDIO_LAT1: int = CONFIG_LAT1
+AUDIO_LAT2: int = CONFIG_LAT2
+
+AUDIO_CHAN1: str = config["AudioCombiner"].get("CHAN1", "both")
+AUDIO_CHAN2: str = config["AudioCombiner"].get("CHAN2", "both")
+AUDIO_AUTO_ADJUST: bool = config["AudioCombiner"].get("Auto_Adjust", True)
+AUDIO_MONITOR_INTERVAL: float = config["AudioCombiner"].get("Monitor_Interval", 1.0)
+
+# ------------------------------
+# FINAL CONFIGURATION VALIDATION
+# ------------------------------
+log_info("=== FINAL CONFIGURATION ===", Fore.CYAN)
+
+# Validate configuration
+if not PRIMARY_DEVICES and not SECONDARY_DEVICES:
+	raise RuntimeError("Error: No device names specified in config. Please configure at least one primary or secondary device.")
+
+# Create combined device filters for scanning
+ALL_DEVICE_FILTERS = PRIMARY_DEVICES + SECONDARY_DEVICES
+
+# Remove empty strings from device lists
+PRIMARY_DEVICES = [device for device in PRIMARY_DEVICES if device]
+SECONDARY_DEVICES = [device for device in SECONDARY_DEVICES if device]
+ALL_DEVICE_FILTERS = [device for device in ALL_DEVICE_FILTERS if device]
+
+# Log final configuration summary
+log_info(f"Primary devices: {PRIMARY_DEVICES}")
+if SECONDARY_DEVICES:
+	log_info(f"Secondary devices: {SECONDARY_DEVICES}")
+log_info(f"Max simultaneous devices: {MAX_DEVICES}")
+if SECONDARY_RECONNECTION_ENABLED and SECONDARY_DEVICES:
+	log_info(f"Secondary reconnection: {SECONDARY_RECONNECTION_MODE} mode (initial: {SECONDARY_INITIAL_DELAY}s, max: {SECONDARY_MAX_DELAY}s)")
+if CONNECTION_DELAY_ENABLED:
+	log_info(f"Connection delay: {CONNECTION_DELAY_SECONDS}s (only after both: {DELAY_ONLY_AFTER_BOTH})", Fore.CYAN)
+if AUDIO_COMBINER_ENABLED:
+	log_info(f"Audio combiner enabled: {AUDIO_SINK1}+{AUDIO_SINK2} -> {AUDIO_COMBINED} (latencies: {AUDIO_LAT1}ms/{AUDIO_LAT2}ms)", Fore.MAGENTA)
+	if AUDIO_GTK_UI_ENABLED:
+		log_info(f"GTK UI enabled for audio combiner", Fore.CYAN)
+log_info(f"GTK UI survival on reconnect: {'enabled' if KEEP_GTK_ON_RECONNECT else 'disabled'}", Fore.CYAN)
+if FINAL_OPERATION_MODE == "primary_only":
+	log_info("Operation Mode: PRIMARY ONLY", Fore.YELLOW)
+elif FINAL_OPERATION_MODE == "secondary_only":
+	log_info("Operation Mode: SECONDARY ONLY", Fore.YELLOW)
+else:
+	log_info("Operation Mode: Normal (both primary and secondary)")
+
+# Store current active latencies
+current_lat1 = AUDIO_LAT1
+current_lat2 = AUDIO_LAT2
+
+# GTK UI values start as None
+GTK_UI_LAT1: Optional[int] = None
+GTK_UI_LAT2: Optional[int] = None
+
+# GTK UI survival setting
+KEEP_GTK_ON_RECONNECT_GLOBAL = KEEP_GTK_ON_RECONNECT
+
+# ------------------------------
 # THREAD-SAFE GLOBAL STATE
 # ------------------------------
-# All access MUST use global_lock
 processed_devices: Set[str] = set()
-connected_devices: Dict[str, Dict] = {}  # mac -> {name, volume, last_seen, device_type, priority}
+connected_devices: Dict[str, Dict] = {}
 
-# Threading & process events (thread-safe by design)
+# Threading & process events
 shutdown_evt = threading.Event()
 reconnect_evt = threading.Event()
 reset_evt = threading.Event()
 asha_restart_evt = threading.Event()
 
-# ASHA process state (protected by global_lock)
+# ASHA process state
 asha_handle: Optional[Tuple[int, int]] = None
 asha_started: bool = False
 
-# Legacy-style connection tracking (simpler approach)
-primary_connection_in_progress = threading.Event()
-secondary_connection_in_progress = threading.Event()
+# Track connection attempts per MAC to prevent duplicate attempts
+connection_attempts_in_progress: Set[str] = set()
 
 # Secondary device reconnection tracking
-secondary_reconnection_attempts: Dict[str, Dict[str, Any]] = {}  # mac -> {attempts: int, next_delay: float, last_attempt: float}
+secondary_reconnection_attempts: Dict[str, Dict[str, Any]] = {}
 
 # Connection delay tracking
 connection_delay_active = threading.Event()
@@ -800,7 +1030,19 @@ class AudioCombinerManager:
 		log_audio(f"Starting audio combiner monitor loop with latencies: {self.current_lat1}ms/{self.current_lat2}ms")
 		self._refresh_sink_cache()
 		
-		while not audio_combiner_stop.is_set():
+		while True:
+			# Check if we should stop
+			if audio_combiner_stop.is_set():
+				# Check if this is a pause (keep alive) or full stop
+				if not audio_combiner_started.is_set():
+					# Full stop requested
+					log_audio("Audio combiner monitor loop exiting (full stop)")
+					break
+				else:
+					# Just a pause - wait a bit and check again
+					time.sleep(0.5)
+					continue
+			
 			try:
 				# Check if both sinks are still available
 				sinks = self._refresh_sink_cache()
@@ -825,6 +1067,8 @@ class AudioCombinerManager:
 			except Exception as e:
 				log_error(f"Audio monitor error: {e}")
 				time.sleep(2.0)
+		
+		log_audio("Audio combiner monitor loop stopped")
 	
 	def set_latencies(self, lat1_ms: int, lat2_ms: int, force_update: bool = True) -> None:
 		"""Update audio sink latencies - completely independent from config"""
@@ -1656,9 +1900,10 @@ secondary_reconnection_manager = SecondaryReconnectionManager()
 # DEVICE MANAGEMENT CLASS
 # ------------------------------
 class DeviceManager:
-	def __init__(self, gtk_enabled: bool = False):
+	def __init__(self, gtk_enabled: bool = False, keep_gtk_on_reconnect: bool = False):
 		self.device_volumes: Dict[str, str] = {}  # mac -> volume value
 		self.gtk_enabled = gtk_enabled
+		self.keep_gtk_on_reconnect = keep_gtk_on_reconnect
 		
 	def get_device_volume(self, mac: str, default_volume: str) -> str:
 		"""Get volume for specific device, with fallback to default"""
@@ -1714,12 +1959,6 @@ class DeviceManager:
 				'device_type': device_type,
 			}
 		
-		# Clear connection in progress flags when connection succeeds
-		if device_type == "primary":
-			primary_connection_in_progress.clear()
-		elif device_type == "secondary":
-			secondary_connection_in_progress.clear()
-			
 		# Clear any reconnection attempts for this device
 		if device_type == "secondary" and mac in secondary_reconnection_attempts:
 			with global_lock:
@@ -1729,16 +1968,26 @@ class DeviceManager:
 		# Start connection delay if configured
 		connection_delay_manager.start_delay(device_type, self)
 		
+		# Check if we should resume audio combiner
+		if (self.keep_gtk_on_reconnect and 
+			AUDIO_COMBINER_ENABLED and 
+			audio_combiner_started.is_set() and 
+			audio_combiner_stop.is_set()):
+			
+			log_audio("Device reconnected, resuming audio combiner")
+			self.resume_audio_combiner()
+		
 		# Start audio combiner if both devices are connected and feature is enabled
-		if (AUDIO_COMBINER_ENABLED and 
+		elif (AUDIO_COMBINER_ENABLED and 
 			self.get_connected_primary_count() >= 1 and 
 			self.get_connected_secondary_count() >= 1 and
 			not audio_combiner_started.is_set()):
+			
 			log_audio("Both devices connected, starting audio combiner")
 			self.start_audio_combiner()
 			
 			# Start GTK UI if enabled
-			if self.gtk_enabled and (AUDIO_GTK_UI_ENABLED or ENV_GTK_UI):
+			if self.gtk_enabled and AUDIO_GTK_UI_ENABLED:
 				log_gtk("Starting GTK UI for audio combiner (completely independent from config)")
 				start_gtk_ui()
 	
@@ -1754,11 +2003,7 @@ class DeviceManager:
 				del connected_devices[mac]
 		
 		# Clear connection flags when device is removed
-		if device_type == "primary":
-			primary_connection_in_progress.clear()
-		elif device_type == "secondary":
-			secondary_connection_in_progress.clear()
-			
+		if device_type == "secondary":
 			# Start reconnection attempt for secondary device if enabled
 			if (secondary_reconnect_enabled and device_name and 
 				not shutdown_evt.is_set() and self.can_connect_more()):
@@ -1768,17 +2013,58 @@ class DeviceManager:
 		# Handle delay reset on device disconnect
 		connection_delay_manager.handle_device_disconnect(device_type, self)
 		
-		# Stop audio combiner if we no longer have both devices
+		# Check if we're shutting down or this is a normal reconnection event
+		if shutdown_evt.is_set():
+			# Full shutdown - stop everything
+			if AUDIO_COMBINER_ENABLED and audio_combiner_started.is_set():
+				log_audio("Shutdown in progress, stopping audio combiner")
+				self.stop_audio_combiner(keep_alive=False)
+				if self.gtk_enabled:
+					log_gtk("Stopping GTK UI (shutdown)")
+					stop_gtk_ui()
+		else:
+			# Check if we're in a reconnect event and keep_gtk_on_reconnect is enabled
+			if self.keep_gtk_on_reconnect and KEEP_GTK_ON_RECONNECT_GLOBAL:
+				# Keep GTK UI and audio combiner alive during reconnect
+				log_audio("Device disconnected but keeping GTK UI and audio combiner alive (keep_gtk_on_reconnect enabled)")
+				# Only pause monitoring, don't stop the combiner
+				audio_combiner_stop.set()
+				# Wait a bit for monitor to pause
+				time.sleep(0.5)
+				# Note: We don't clear audio_combiner_started so it knows to resume when devices reconnect
+			else:
+				# Original behavior - stop audio combiner and GTK UI if we no longer have both devices
+				primary_count = self.get_connected_primary_count()
+				secondary_count = self.get_connected_secondary_count()
+				
+				if AUDIO_COMBINER_ENABLED and audio_combiner_started.is_set():
+					if not (primary_count >= 1 and secondary_count >= 1):
+						log_audio("No longer have both devices, stopping audio combiner")
+						self.stop_audio_combiner(keep_alive=False)
+						
+						# Stop GTK UI if running
+						if self.gtk_enabled:
+							log_gtk("Stopping GTK UI (audio combiner stopped)")
+							stop_gtk_ui()
+	
+	def resume_audio_combiner(self):
+		"""Resume audio combiner monitoring after reconnection"""
 		if (AUDIO_COMBINER_ENABLED and 
-			audio_combiner_started.is_set() and
-			not (self.get_connected_primary_count() >= 1 and self.get_connected_secondary_count() >= 1)):
-			log_audio("No longer have both devices, stopping audio combiner")
-			self.stop_audio_combiner()
+			audio_combiner_started.is_set() and 
+			audio_combiner_stop.is_set()):
 			
-			# Stop GTK UI if running
-			if self.gtk_enabled:
-				log_gtk("Stopping GTK UI (audio combiner stopped)")
-				stop_gtk_ui()
+			log_audio("Resuming audio combiner monitoring after reconnection")
+			audio_combiner_stop.clear()
+			
+			# Restart the monitor thread if needed
+			if audio_combiner_manager and audio_combiner_manager.monitor_thread:
+				if not audio_combiner_manager.monitor_thread.is_alive():
+					log_audio("Restarting audio combiner monitor thread")
+					audio_combiner_manager.monitor_thread = threading.Thread(
+						target=audio_combiner_manager.monitor_loop, 
+						daemon=True
+					)
+					audio_combiner_manager.monitor_thread.start()
 	
 	def get_connected_devices_info(self) -> List[Tuple[str, str, str]]:
 		"""Get list of connected devices as (mac, name, type) tuples"""
@@ -1823,13 +2109,21 @@ class DeviceManager:
 		elif mode_override == "secondary_only" and device_type != "secondary":
 			return False
 			
-		# LEGACY LOGIC: Simply check if we're not already connecting to this device type
-		if device_type == "primary":
-			return not primary_connection_in_progress.is_set()
-		elif device_type == "secondary":
-			return not secondary_connection_in_progress.is_set()
-			
-		return False
+		# ALLOW ALL PRIMARY CONNECTION ATTEMPTS - No blocking for primary devices
+		# Only check for secondary devices if we're already connecting to one
+		if device_type == "secondary":
+			# Check if any secondary connection is already in progress
+			with global_lock:
+				# Check if any MAC in connection_attempts_in_progress corresponds to a secondary device
+				for mac in connection_attempts_in_progress:
+					if mac in connected_devices and connected_devices[mac].get('device_type') == 'secondary':
+						return False
+				# Also check current connections
+				if self.get_connected_secondary_count() >= 1 and len(SECONDARY_DEVICES) == 1:
+					# If we only have one secondary device configured and it's already connected/connecting
+					return False
+					
+		return True
 
 	def get_connection_status_summary(self) -> str:
 		"""Get a summary of current connection status"""
@@ -1856,8 +2150,12 @@ class DeviceManager:
 		if AUDIO_COMBINER_ENABLED:
 			if audio_combiner_started.is_set():
 				status_str += " [AUDIO COMBINED]"
-				if self.gtk_enabled and (AUDIO_GTK_UI_ENABLED or ENV_GTK_UI):
+				if self.gtk_enabled and AUDIO_GTK_UI_ENABLED:
 					status_str += " [GTK UI - INDEPENDENT]"
+					
+		# Add GTK UI survival status
+		if self.keep_gtk_on_reconnect and self.gtk_enabled:
+			status_str += " [GTK SURVIVES RECONNECT]"
 			
 		return f"{status_str} ({total_count}/{MAX_DEVICES} total)"
 	
@@ -1872,12 +2170,28 @@ class DeviceManager:
 			)
 			audio_combiner_thread.start()
 	
-	def stop_audio_combiner(self):
-		"""Stop the audio combiner"""
-		audio_combiner_stop.set()
-		if audio_combiner_thread and audio_combiner_thread.is_alive():
-			audio_combiner_thread.join(timeout=2.0)
-		audio_combiner_started.clear()
+	def stop_audio_combiner(self, keep_alive: bool = False):
+		"""Stop the audio combiner with option to keep alive during reconnection"""
+		global audio_combiner_thread
+		
+		if keep_alive and self.keep_gtk_on_reconnect:
+			log_audio("Audio combiner paused but not stopped (keep_gtk_on_reconnect enabled)")
+			# Only pause monitoring, don't unload modules
+			audio_combiner_stop.set()
+			# Wait a bit for monitor to pause
+			time.sleep(0.5)
+			# But don't clear audio_combiner_started so it can resume
+		else:
+			log_audio("Stopping audio combiner (full stop)")
+			audio_combiner_stop.set()
+			if audio_combiner_thread and audio_combiner_thread.is_alive():
+				audio_combiner_thread.join(timeout=2.0)
+			audio_combiner_started.clear()
+			
+			# Only stop GTK UI if keep_gtk_on_reconnect is False
+			if self.gtk_enabled and not self.keep_gtk_on_reconnect:
+				log_gtk("Stopping GTK UI (audio combiner stopped)")
+				stop_gtk_ui()
 	
 	def _audio_combiner_worker(self):
 		"""Worker thread for audio combiner"""
@@ -1892,9 +2206,8 @@ class DeviceManager:
 			log_error(f"Audio combiner worker error: {e}")
 			audio_combiner_started.clear()
 
-# Initialize device manager with GTK setting
-gtk_enabled = AUDIO_GTK_UI_ENABLED or ENV_GTK_UI
-device_manager = DeviceManager(gtk_enabled=gtk_enabled)
+# Global device manager - will be initialized in main()
+device_manager = None
 
 # ------------------------------
 # ADVERTISEMENT MANAGEMENT
@@ -1919,7 +2232,7 @@ class Advertisement(dbus.service.Object):
 				'Type': self.ad_type,
 				'ServiceUUIDs': dbus.Array(self.service_uuids, signature='s'),
 				'Includes': dbus.Array(self.includes, signature='s'),
-				'LocalName': self.local_name,
+				'LocalName': dbus.String(self.local_name),
 				'LegacyAdvertising': dbus.Boolean(True)
 			}
 		}
@@ -1935,7 +2248,7 @@ class Advertisement(dbus.service.Object):
 # MAIN MANAGER CLASS
 # ------------------------------
 class BluetoothAshaManager:
-	def __init__(self, args: argparse.Namespace) -> None:
+	def __init__(self, args: argparse.Namespace, device_manager_instance) -> None:
 		self.args = args
 		self.ad_obj = None
 		self.adv_loop = None
@@ -1944,97 +2257,31 @@ class BluetoothAshaManager:
 		self.gatt_triggered: bool = False
 		self.timer: bool = False
 		self.ad_registered: bool = False
-		self.device_manager = device_manager
+		self.device_manager = device_manager_instance
+		self.keep_gtk_on_reconnect = False
+		self._in_partial_restart = False
 		
-		# Determine secondary reconnection setting
-		if hasattr(args, 'secondary_reconnect') and args.secondary_reconnect is not None:
-			self.secondary_reconnect_enabled = args.secondary_reconnect
-			log_info(f"Secondary reconnection {'enabled' if self.secondary_reconnect_enabled else 'disabled'} via command line", Fore.YELLOW)
-		else:
-			self.secondary_reconnect_enabled = SECONDARY_RECONNECTION_ENABLED
-			log_info(f"Secondary reconnection {'enabled' if self.secondary_reconnect_enabled else 'disabled'} via config")
-		
-		# Set volume value based on arguments and environment variable
-		env_volume = os.getenv("LND")
-		if env_volume:
-			self.volume_value = env_volume
-			log_info(f"Using environment variable LND={env_volume} for volume (overrides config)", Fore.YELLOW)
-		elif self.args.loudness:
-			self.volume_value = config["GATT"]["Volume"]["Value"]
-			log_info(f"Using configured volume value: {self.volume_value}", Fore.YELLOW)
-		else:
-			self.volume_value = config["GATT"]["Volume"]["Value"]
-			log_info(f"Using configured volume value: {self.volume_value}")
+		# Set volume value (already determined by priority order)
+		self.volume_value = FINAL_VOLUME_VALUE
+		log_info(f"Final volume value: {self.volume_value}", Fore.GREEN)
 
-		# Determine operation mode
-		self.operation_mode = self._determine_operation_mode()
-		
-		# Connection delay command line override
-		if hasattr(args, 'connection_delay') and args.connection_delay is not None:
-			if args.connection_delay == 0:
-				connection_delay_manager.delay_enabled = False
-				log_info("Connection delay disabled via command line", Fore.YELLOW)
-			else:
-				connection_delay_manager.delay_enabled = True
-				connection_delay_manager.delay_seconds = args.connection_delay
-				log_info(f"Connection delay set to {args.connection_delay}s via command line", Fore.YELLOW)
-		
-		if hasattr(args, 'delay_only_after_both') and args.delay_only_after_both is not None:
-			connection_delay_manager.only_after_both = args.delay_only_after_both
-			log_info(f"Delay only after both: {args.delay_only_after_both}", Fore.YELLOW)
-		
-		# Audio combiner command line override
-		if hasattr(args, 'audio_combiner') and args.audio_combiner is not None:
-			global AUDIO_COMBINER_ENABLED
-			AUDIO_COMBINER_ENABLED = args.audio_combiner
-			log_info(f"Audio combiner {'enabled' if AUDIO_COMBINER_ENABLED else 'disabled'} via command line", Fore.MAGENTA)
-		
-		if hasattr(args, 'lat1') and args.lat1 is not None:
-			global AUDIO_LAT1, current_lat1
-			AUDIO_LAT1 = args.lat1
-			current_lat1 = args.lat1
-			log_info(f"Audio latency 1 set to {AUDIO_LAT1}ms via command line", Fore.MAGENTA)
-		
-		if hasattr(args, 'lat2') and args.lat2 is not None:
-			global AUDIO_LAT2, current_lat2
-			AUDIO_LAT2 = args.lat2
-			current_lat2 = args.lat2
-			log_info(f"Audio latency 2 set to {AUDIO_LAT2}ms via command line", Fore.MAGENTA)
-		
-		# GTK UI command line override
-		if hasattr(args, 'gtk_ui') and args.gtk_ui is not None:
-			global AUDIO_GTK_UI_ENABLED
-			AUDIO_GTK_UI_ENABLED = args.gtk_ui
-			log_info(f"GTK UI {'enabled' if AUDIO_GTK_UI_ENABLED else 'disabled'} via command line", Fore.CYAN)
-		
-		# Update device manager with new GTK setting
-		device_manager.gtk_enabled = AUDIO_GTK_UI_ENABLED or ENV_GTK_UI
-		
-	def _determine_operation_mode(self) -> Optional[str]:
-		"""Determine operation mode from environment variables and command line arguments"""
-		env_primary_only = os.getenv("PRI_O")
-		env_secondary_only = os.getenv("SEC_O")
-		cli_primary_only = getattr(self.args, 'primary_only', False)
-		cli_secondary_only = getattr(self.args, 'secondary_only', False)
-		
-		# Command line takes precedence over environment
-		if cli_primary_only:
-			log_info("PRIMARY ONLY mode enabled via command line", Fore.YELLOW)
-			return "primary_only"
-		elif cli_secondary_only:
-			log_info("SECONDARY ONLY mode enabled via command line", Fore.YELLOW)
-			return "secondary_only"
-		elif env_primary_only and env_primary_only.lower() in ['1', 'true', 'yes']:
-			log_info(f"PRIMARY ONLY mode enabled via environment variable PRIMARY_ONLY={env_primary_only}", Fore.YELLOW)
-			return "primary_only"
-		elif env_secondary_only and env_secondary_only.lower() in ['1', 'true', 'yes']:
-			log_info(f"SECONDARY ONLY mode enabled via environment variable SECONDARY_ONLY={env_secondary_only}", Fore.YELLOW)
-			return "secondary_only"
-		
-		log_info("Normal operation mode (both primary and secondary devices allowed)")
-		return None
+		# Set operation mode (already determined by priority order)
+		self.operation_mode = FINAL_OPERATION_MODE
+		if self.operation_mode == "primary_only":
+			log_info("Final operation mode: PRIMARY ONLY", Fore.GREEN)
+		elif self.operation_mode == "secondary_only":
+			log_info("Final operation mode: SECONDARY ONLY", Fore.GREEN)
+		else:
+			log_info("Final operation mode: Normal (both primary and secondary)", Fore.GREEN)
 
-	# Bluetooth Initialization
+		# Set secondary reconnection (already determined by priority order)
+		self.secondary_reconnect_enabled = FINAL_SECONDARY_RECONNECTION_ENABLED
+		log_info(f"Secondary reconnection: {'enabled' if self.secondary_reconnect_enabled else 'disabled'}", Fore.GREEN)
+
+		# Update device manager with final GTK settings
+		self.device_manager.gtk_enabled = AUDIO_GTK_UI_ENABLED
+		self.device_manager.keep_gtk_on_reconnect = KEEP_GTK_ON_RECONNECT
+		
 	def initialize_bluetooth(self) -> None:
 		"""Initialize Bluetooth by unblocking it, powering on, and setting up agents"""
 		log_info("Initializing Bluetooth...", Fore.BLUE)
@@ -2216,11 +2463,9 @@ class BluetoothAshaManager:
 
 	async def async_connect_specific(self, mac_address: str, device_type: str) -> bool:
 		"""Asynchronously attempt to connect to a given device up to three times"""
-		# Set connection in progress flag
-		if device_type == "primary":
-			primary_connection_in_progress.set()
-		elif device_type == "secondary":
-			secondary_connection_in_progress.set()
+		# Add MAC to connection attempts tracking
+		with global_lock:
+			connection_attempts_in_progress.add(mac_address)
 		
 		try:
 			return await asyncio.wait_for(self._connect_attempt(mac_address, device_type), timeout=MAX_TIMEOUT)
@@ -2234,11 +2479,9 @@ class BluetoothAshaManager:
 				os.execv(sys.executable, [sys.executable] + sys.argv)
 			return False
 		finally:
-			# Clear connection in progress flag
-			if device_type == "primary":
-				primary_connection_in_progress.clear()
-			elif device_type == "secondary":
-				secondary_connection_in_progress.clear()
+			# Remove MAC from connection attempts tracking
+			with global_lock:
+				connection_attempts_in_progress.discard(mac_address)
 
 	async def _connect_attempt(self, mac_address: str, device_type: str) -> bool:
 		if not re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac_address):
@@ -2284,9 +2527,40 @@ class BluetoothAshaManager:
 		return False
 
 	def handle_new_device(self, mac: str, name: str) -> None:
-		"""LEGACY-STYLE: Process a newly discovered device - instantly connect to any matching device"""
+		"""Process a newly discovered device - instantly connect to any matching device"""
+		# NEW: Handle device replacement for same-name devices
+		with global_lock:
+			# Check for same-name devices in connected_devices
+			same_name_old_mac = None
+			for connected_mac, device_info in connected_devices.items():
+				if device_info['name'] == name and connected_mac != mac:
+					same_name_old_mac = connected_mac
+					break
+			
+			# Also check in connection attempts
+			if same_name_old_mac is None:
+				# We need to check if any device with the same name is currently being attempted
+				# We don't store names in connection_attempts_in_progress, so we can't check directly
+				# But we can check if the MAC is already being attempted
+				if mac in connection_attempts_in_progress:
+					log_debug(f"Already attempting connection to {mac}, skipping")
+					return
+
+			if same_name_old_mac:
+				log_device(f"Device {name} appears with new MAC {mac} (old: {same_name_old_mac}) - replacing device")
+				# Remove old device from connected devices
+				if same_name_old_mac in connected_devices:
+					del connected_devices[same_name_old_mac]
+				# Remove old MAC from processed devices
+				processed_devices.discard(same_name_old_mac)
+				# Clear any reconnection attempts for old MAC
+				if same_name_old_mac in secondary_reconnection_attempts:
+					del secondary_reconnection_attempts[same_name_old_mac]
+		
 		if any(black in name for black in BLACKLIST):
 			log_info(f"Device {name} ({mac}) is blacklisted. Skipping connection.")
+			with global_lock:
+				processed_devices.discard(mac)
 			return
 
 		if not re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac):
@@ -2298,9 +2572,11 @@ class BluetoothAshaManager:
 		# Determine device type
 		device_type = self.device_manager.get_device_type(name)
 
-		# LEGACY LOGIC: Check if we should connect based on simple rules
+		# Check if we should connect based on simple rules
 		if not self.device_manager.should_connect_device(device_type, self.operation_mode):
-			log_debug(f"Skipping {device_type} device {name} - connection limit or mode restriction")
+			# log_debug(f"Skipping {device_type} device {name} - connection limit or mode restriction")
+			with global_lock:
+				processed_devices.discard(mac)
 			return
 
 		# Check if we can connect more devices (general limit)
@@ -2316,6 +2592,12 @@ class BluetoothAshaManager:
 			with global_lock:
 				processed_devices.discard(mac)
 			return
+
+		# Check if connection is already being attempted for this MAC
+		with global_lock:
+			if mac in connection_attempts_in_progress:
+				log_debug(f"Connection attempt already in progress for {mac}, skipping")
+				return
 
 		log_device(f"New device detected: {name} ({mac})", device_type)
 		
@@ -2933,26 +3215,81 @@ exit
 					log_warning("Cleaning up orphaned ASHA processes")
 					kill_existing_asha_processes()
 
-	def cleanup(self) -> None:
+	def _partial_restart(self):
+		"""Perform a partial restart (keeping GTK UI and audio combiner alive)"""
+		self._in_partial_restart = True
+		log_info("Partial restart triggered (keeping GTK UI and audio combiner alive)")
+		
+		try:
+			# Stop advertising
+			self.stop_advertising(self.args.disable_advertisement)
+			
+			# Stop the scan thread
+			if self.scan_thread and self.scan_thread.is_alive():
+				# We'll create a new scan thread, so let the old one finish
+				pass
+			
+			# Terminate the ASHA sink
+			self.terminate_asha()
+			
+			# Clear connected and processed devices
+			with global_lock:
+				connected_devices.clear()
+				processed_devices.clear()
+				connection_attempts_in_progress.clear()
+			
+			# Reset the connection delay
+			connection_delay_manager.reset_delay()
+			
+			# Reset the secondary reconnection attempts
+			secondary_reconnection_manager.stop_all_reconnections()
+			
+			# Reinitialize Bluetooth
+			self.initialize_bluetooth()
+			
+			# Restart advertising
+			self.start_advertising(self.args.disable_advertisement)
+			
+			# Restart the scan thread
+			self.start_continuous_scan()
+			
+			log_info("Partial restart completed")
+			
+		except Exception as e:
+			log_error(f"Partial restart failed: {e}")
+			# Fall back to full restart
+			self.cleanup()
+			os.execv(sys.executable, [sys.executable] + sys.argv)
+		finally:
+			self._in_partial_restart = False
+
+	def cleanup(self, partial_restart: bool = False) -> None:
 		"""Cleanup routine for shutting down all components gracefully"""
 		log_info("Cleaning up...", Fore.BLUE)
-		self.stop_advertising(self.args.disable_advertisement)
 		
-		# Stop all secondary reconnection attempts
-		secondary_reconnection_manager.stop_all_reconnections()
+		# Only stop GTK UI and audio combiner if not in partial restart
+		if not partial_restart and not self._in_partial_restart:
+			self.stop_advertising(self.args.disable_advertisement)
+			
+			# Stop all secondary reconnection attempts
+			secondary_reconnection_manager.stop_all_reconnections()
+			
+			# Reset any active connection delay
+			connection_delay_manager.reset_delay()
+			
+			# Only stop GTK UI and audio combiner on full shutdown
+			# NOT during normal reconnection events when keep_gtk_on_reconnect is True
+			if shutdown_evt.is_set():
+				# Full shutdown - stop everything
+				if self.device_manager.gtk_enabled:
+					log_gtk("Stopping GTK UI (shutdown)")
+					stop_gtk_ui()
+				
+				if audio_combiner_started.is_set():
+					log_audio("Stopping audio combiner (shutdown)")
+					self.device_manager.stop_audio_combiner(keep_alive=False)
 		
-		# Reset any active connection delay
-		connection_delay_manager.reset_delay()
-		
-		# Stop GTK UI if running
-		if device_manager.gtk_enabled:
-			stop_gtk_ui()
-		
-		# Stop audio combiner if running
-		if audio_combiner_started.is_set():
-			device_manager.stop_audio_combiner()
-		
-		if self.args.disconnect:
+		if self.args.disconnect and not partial_restart and not self._in_partial_restart:
 			run_command("bluetoothctl agent off", check=False)
 			run_command("bluetoothctl power off", check=False)
 		
@@ -2961,10 +3298,14 @@ exit
 			if asha_handle:
 				self.terminate_asha()
 		
-		run_command("bluetoothctl pairable off", check=False)
-		shutdown_evt.set()
-		async_manager.stop()
-		log_info("Cleanup complete", Fore.GREEN)
+		if not partial_restart and not self._in_partial_restart:
+			run_command("bluetoothctl pairable off", check=False)
+			if not shutdown_evt.is_set():
+				shutdown_evt.set()
+			async_manager.stop()
+			log_info("Cleanup complete", Fore.GREEN)
+		else:
+			log_info("Partial cleanup complete (GTK UI and audio combiner preserved)", Fore.GREEN)
 
 	def signal_handler(self, sig, frame) -> None:
 		"""Handle signals for graceful shutdown"""
@@ -3052,87 +3393,50 @@ exit
 					os.execv(sys.executable, [sys.executable] + sys.argv)
 
 				if reconnect_evt.is_set():
-					log_info("Reconnect triggered, restarting the script...")
-					reconnect_evt.clear()
-					self.cleanup()
-					os.execv(sys.executable, [sys.executable] + sys.argv)
+					if self.device_manager.keep_gtk_on_reconnect and KEEP_GTK_ON_RECONNECT_GLOBAL:
+						log_info("Reconnect triggered with keep_gtk_on_reconnect enabled - performing partial restart")
+						reconnect_evt.clear()
+						self._partial_restart()
+					else:
+						log_info("Reconnect triggered, restarting...")
+						reconnect_evt.clear()
+						self.cleanup()
+						os.execv(sys.executable, [sys.executable] + sys.argv)
 
-				time.sleep(1)
+				time.sleep(0.5)
+
 		except Exception as e:
-			log_error(f"Fatal error: {e}")
+			log_error(f"Main loop exception: {e}")
 		finally:
 			self.cleanup()
 
-# ------------------------------
-# ENTRY POINT
-# ------------------------------
+# Main entry point
 def main() -> None:
-	global MAX_DEVICES, PRIORITY_PRIMARY
+	"""Main entry point with argument parsing"""
+	global device_manager
 	
-	parser = argparse.ArgumentParser(description="Bluetooth ASHA Manager with Audio Sink Combining")
-	parser.add_argument('-c', '--clean-state', action='store_true',
-						help='Skip automatic GATT operations on state change')
-	parser.add_argument('-r', '--reconnect', action='store_true',
-						help='Enable automatic ASHA restart if device disconnects')
-	parser.add_argument('-d', '--disconnect', action='store_true',
-						help='Disconnect Bluetooth devices on exit')
-	parser.add_argument('-p', '--pair', action='store_true',
-						help='Enable persistent pairing mode')
-	parser.add_argument('-da', '--disable-advertisement', action='store_true',
-						help='Disable Bluetooth LE advertising')
-	parser.add_argument('-rof','--reset-on-failure', action='store_true', 
-						help='Auto-reset adapter on ASHA connect failure')
-	parser.add_argument('-l', '--loudness', action='store_true',
-						help="Override configured GATT Trigger. It ranged from 0x80 to 0xFF.\nFF may not work on some devices try 0xF0 instead.\nDo allow env can be set as LND= appended into the command line for ease of access")
-	parser.add_argument('-md', '--max-devices', type=int, default=None,
-						help=f"Maximum number of devices to connect simultaneously (default: {MAX_DEVICES})")
-	parser.add_argument('-pp', '--priority-primary', action='store_true', default=None,
-						help="Prioritize primary devices over secondary (default: from config)")
-	parser.add_argument('-po','--primary-only', action='store_true',
-						help="Only connect to primary devices (overrides config and environment(PRI_O))")
-	parser.add_argument('-so','--secondary-only', action='store_true',
-						help="Only connect to secondary devices (overrides config and environment(SEC_O))")
-	
-	# Secondary reconnection argument
-	parser.add_argument('-sr', '--secondary-reconnect', action='store_true', default=None,
-						help='Enable background reconnection for secondary devices without restarting Bluetooth (overrides config)')
-	parser.add_argument('-nsr', '--no-secondary-reconnect', action='store_false', dest='secondary_reconnect',
-						help='Disable background reconnection for secondary devices (overrides config)')
-	
-	# Connection delay arguments
-	parser.add_argument('-cd', '--connection-delay', type=float, default=None,
-						help='Connection delay in seconds after device connects (0 to disable, overrides config)')
-	parser.add_argument('-dob', '--delay-only-after-both', action='store_true', default=None,
-						help='Only apply connection delay after both primary and secondary are connected')
-	
-	# Audio combiner arguments
-	parser.add_argument('-ac', '--audio-combiner', action='store_true', default=None,
-						help='Enable audio sink combiner for ASHA and BT devices (overrides config)')
-	parser.add_argument('-nac', '--no-audio-combiner', action='store_false', dest='audio_combiner',
-						help='Disable audio sink combiner (overrides config)')
-	parser.add_argument('-lat1', '--lat1', type=int, default=None,
-						help='Audio latency for ASHA sink in milliseconds (overrides config)')
-	parser.add_argument('-lat2', '--lat2', type=int, default=None,
-						help='Audio latency for BT sink in milliseconds (overrides config)')
-	
-	# GTK UI arguments
-	parser.add_argument('-gtk', '--gtk-ui', action='store_true', default=None,
-						help='Enable GTK UI for adjusting audio latencies (overrides config)')
-	parser.add_argument('-ngtk', '--no-gtk-ui', action='store_false', dest='gtk_ui',
-						help='Disable GTK UI (overrides config)')
-	
+	parser = create_parser()
+	parser.add_argument('-h', '--help', action='help', help='Show this help message and exit')
 	args = parser.parse_args()
-
-	if args.max_devices is not None:
-		MAX_DEVICES = args.max_devices
-		log_info(f"Maximum devices set to: {MAX_DEVICES}")
-
-	if args.priority_primary is not None:
-		PRIORITY_PRIMARY = args.priority_primary
-		log_info(f"Primary priority set to: {PRIORITY_PRIMARY}")
-
-	manager = BluetoothAshaManager(args)
-	manager.run()
+	
+	# Initialize device manager with current GTK settings
+	device_manager = DeviceManager(
+		gtk_enabled=AUDIO_GTK_UI_ENABLED,
+		keep_gtk_on_reconnect=KEEP_GTK_ON_RECONNECT
+	)
+	
+	# Initialize the manager
+	manager = BluetoothAshaManager(args, device_manager)
+	
+	try:
+		manager.run()
+	except KeyboardInterrupt:
+		log_info("Shutdown requested by user")
+		manager.cleanup()
+	except Exception as e:
+		log_error(f"Fatal error: {e}")
+		manager.cleanup()
+		sys.exit(1)
 
 if __name__ == "__main__":
 	main()
