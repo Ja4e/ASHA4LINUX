@@ -6,4 +6,4 @@ Supports other ASHA devices for volume control with provided bash script (volume
 TODO:
 improve the wiki
 
-I need to make an automatic delay based on the continous polling where it was getting packetloss exits seems quite uhm predictable
+I need to make an automatic delay based on the continous polling where it was getting packetloss exits seems quite uhm predictable for SBC codec 
