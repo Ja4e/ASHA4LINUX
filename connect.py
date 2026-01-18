@@ -439,7 +439,7 @@ EXECUTABLE: str = os.path.join(BUILD_DIR, "asha_pipewire_sink")
 RETRY_DELAY: float = random.uniform(0.4, 1.0)
 DEFAULT_RETRY_INTERVAL: float = 0.0
 MAX_TIMEOUT: float = random.uniform(600, 1200)
-Timeout_qs: float = random.uniform(80000, 100000)
+Timeout_qs: float = random.uniform(1000000, 10000000)
 
 # Blacklist devices to avoid
 BLACKLIST: list = config.get("Blacklist", [])
