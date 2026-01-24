@@ -5,5 +5,3 @@ Supports other ASHA devices for volume control with provided bash script (volume
 
 TODO:
 improve the wiki
-
-problem solved just force it 
