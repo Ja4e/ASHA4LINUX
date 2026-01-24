@@ -240,6 +240,7 @@ def load_config(config_path: str) -> dict:
 				},
 				"Frequency_int": 1,
 				"Detect_loss": False,
+				"Detect_loss_reconnect": False,
 				"Per_Device_Volume": True
 			},
 			"DELAY": {
@@ -281,7 +282,16 @@ def load_config(config_path: str) -> dict:
 				"CHAN1": "both",
 				"CHAN2": "both",
 				"Auto_Adjust": True,
-				"Monitor_Interval": 1.0
+				"Monitor_Interval": 1.0,
+				# NEW: Packet loss detection with latency adjustment
+				"PacketLoss_Adjust": {
+					"Enabled": True,  # Enable/disable auto-adjustment on packet loss
+					"Threshold": 3,    # Number of consecutive packet loss detections before adjusting
+					"Adjust_Step": 30,  # How much to increase latency by (ms)
+					"Max_Latency": 124, # Maximum latency to avoid going too high
+					"Reset_After_Reconnect": True,  # Reset to original latency when secondary reconnects
+					"Affect_Sink": "asha"  # Which sink to adjust: "asha", "bt", or "both"
+				}
 			},
 			"GTK_UI": {
 				"Keep_On_Reconnect": False,
@@ -358,10 +368,12 @@ ENV_OVERRIDES = [
 	"R_GTK_UI",
 	"PRI_O",
 	"SEC_O",
+	"PACKETLOSS_ADJUST",  # ADDED: New environment variable for packet loss adjustment
 ]
 
 # Log environment variable overrides
 log_info("=== ENVIRONMENT VARIABLES (Highest Priority) ===", Fore.YELLOW)
+
 for var in ENV_OVERRIDES:
 	value = os.getenv(var)
 	if value is not None:
@@ -376,6 +388,7 @@ ENV_R_GTK_UI = os.getenv('R_GTK_UI', '').lower() in ['1', 'true', 'yes', 'on']
 ENV_PRIMARY_ONLY = os.getenv("PRI_O", '').lower() in ['1', 'true', 'yes', 'on']
 ENV_SECONDARY_ONLY = os.getenv("SEC_O", '').lower() in ['1', 'true', 'yes', 'on']
 ENV_DEBUG = os.getenv('DEBUG', '0') == '1'
+ENV_PACKETLOSS_ADJUST = os.getenv('AUTO', '').lower() in ['1', 'true', 'yes', 'on']  # ADDED
 
 # ------------------------------
 # CONFIG FILE VALUES (Lowest Priority - Level 3)
@@ -428,6 +441,16 @@ PER_DEVICE_VOLUME: bool = config["GATT"].get("Per_Device_Volume", True)
 # Global
 SEPARATE_BOOLEAN = config["global"].get("Separate_boolean", False)
 Filter_DFU = config["global"].get("Filter_DFU", False)
+
+# Packet loss adjustment config
+PACKETLOSS_ADJUST_CONFIG = config["AudioCombiner"].get("PacketLoss_Adjust", {
+	"Enabled": False,
+	"Threshold": 3,
+	"Adjust_Step": 5,
+	"Max_Latency": 200,
+	"Reset_After_Reconnect": True,
+	"Affect_Sink": "asha"
+})
 
 # ASHA sink repository settings
 REPO_URL: str = "https://github.com/thewierdnut/asha_pipewire_sink.git"
@@ -509,6 +532,12 @@ def create_parser():
 	parser.add_argument('-nkgtk', '--no-keep-gtk-on-reconnect', action='store_false', dest='keep_gtk_on_reconnect',
 						help='Allow GTK UI to be killed during reconnections')
 	
+	# Packet loss adjustment arguments
+	parser.add_argument('-pa', '--packetloss-adjust', action='store_true', default=None,
+						help='Enable auto-adjustment of latency on packet loss detection')
+	parser.add_argument('-npa', '--no-packetloss-adjust', action='store_false', dest='packetloss_adjust',
+						help='Disable auto-adjustment of latency on packet loss')
+	
 	return parser
 
 # Parse command line arguments
@@ -537,6 +566,7 @@ CONFIG_OPTIONS = [
 	("FINAL_DELAY_ONLY_AFTER_BOTH", None, "delay_only_after_both", DELAY_ONLY_AFTER_BOTH),
 	("FINAL_MAX_DEVICES", None, "max_devices", MAX_DEVICES),
 	("FINAL_PRIORITY_PRIMARY", None, "priority_primary", PRIORITY_PRIMARY),
+	("FINAL_PACKETLOSS_ADJUST_ENABLED", "PACKETLOSS_ADJUST", "packetloss_adjust", PACKETLOSS_ADJUST_CONFIG.get("Enabled", False)),  # UPDATED: Added ENV key
 ]
 
 FINAL_VALUES = {}
@@ -546,7 +576,7 @@ def get_cli_value(attr_name):
 	value = getattr(args, attr_name, None)
 	# For boolean flags that default to None, we need to distinguish between not set and False
 	if value is None and attr_name in ['gtk_ui', 'keep_gtk_on_reconnect', 'audio_combiner', 
-									  'secondary_reconnect', 'priority_primary']:
+									  'secondary_reconnect', 'priority_primary', 'packetloss_adjust']:
 		# These are boolean flags that can be explicitly set to False with -n* flags
 		# If not set at all, they remain None
 		return None
@@ -640,6 +670,7 @@ FINAL_CONNECTION_DELAY_SECONDS = FINAL_VALUES.get("FINAL_CONNECTION_DELAY_SECOND
 FINAL_DELAY_ONLY_AFTER_BOTH = FINAL_VALUES.get("FINAL_DELAY_ONLY_AFTER_BOTH", DELAY_ONLY_AFTER_BOTH)
 FINAL_MAX_DEVICES = FINAL_VALUES.get("FINAL_MAX_DEVICES", MAX_DEVICES)
 FINAL_PRIORITY_PRIMARY = FINAL_VALUES.get("FINAL_PRIORITY_PRIMARY", PRIORITY_PRIMARY)
+FINAL_PACKETLOSS_ADJUST_ENABLED = FINAL_VALUES.get("FINAL_PACKETLOSS_ADJUST_ENABLED", PACKETLOSS_ADJUST_CONFIG.get("Enabled", False))
 
 # Update global variables with final values
 MAX_DEVICES = FINAL_MAX_DEVICES
@@ -653,6 +684,7 @@ AUDIO_GTK_UI_ENABLED = FINAL_GTK_UI_ENABLED
 AUDIO_LAT1 = FINAL_LAT1
 AUDIO_LAT2 = FINAL_LAT2
 KEEP_GTK_ON_RECONNECT = FINAL_KEEP_GTK_ON_RECONNECT
+PACKETLOSS_ADJUST_ENABLED = FINAL_PACKETLOSS_ADJUST_ENABLED
 
 # Initialize latencies from config
 AUDIO_LAT1: int = CONFIG_LAT1
@@ -693,6 +725,8 @@ if AUDIO_COMBINER_ENABLED:
 	log_info(f"Audio combiner enabled: {AUDIO_SINK1}+{AUDIO_SINK2} -> {AUDIO_COMBINED} (latencies: {AUDIO_LAT1}ms/{AUDIO_LAT2}ms)", Fore.MAGENTA)
 	if AUDIO_GTK_UI_ENABLED:
 		log_info(f"GTK UI enabled for audio combiner", Fore.CYAN)
+	if PACKETLOSS_ADJUST_ENABLED:
+		log_info(f"Packet loss auto-adjust: Enabled (threshold: {PACKETLOSS_ADJUST_CONFIG.get('Threshold', 3)}, step: {PACKETLOSS_ADJUST_CONFIG.get('Adjust_Step', 5)}ms, reset on reconnect: {PACKETLOSS_ADJUST_CONFIG.get('Reset_After_Reconnect', True)})", Fore.YELLOW)
 log_info(f"GTK UI survival on reconnect: {'enabled' if KEEP_GTK_ON_RECONNECT else 'disabled'}", Fore.CYAN)
 if FINAL_OPERATION_MODE == "primary_only":
 	log_info("Operation Mode: PRIMARY ONLY", Fore.YELLOW)
@@ -749,6 +783,14 @@ audio_combiner_manager: Optional[Any] = None
 gtk_ui_thread: Optional[threading.Thread] = None
 gtk_ui_stop = threading.Event()
 gtk_window = None
+
+# Packet loss adjustment state
+packet_loss_count = 0
+last_packet_loss_time = 0.0
+original_lat1 = AUDIO_LAT1  # Store original latency
+original_lat2 = AUDIO_LAT2
+latency_adjusted = False
+latency_reset_timer: Optional[threading.Timer] = None
 
 # ------------------------------
 # ASYNC EVENT LOOP MANAGEMENT
@@ -1215,6 +1257,9 @@ class GtkLatencyUI:
 		# GTK UI maintains its own COMPLETELY INDEPENDENT state
 		self.current_lat1 = AUDIO_LAT1  # Start with initial session values
 		self.current_lat2 = AUDIO_LAT2
+		# Store original session values for reset
+		self.session_start_lat1 = AUDIO_LAT1
+		self.session_start_lat2 = AUDIO_LAT2
 
 	def run(self):
 		import gi
@@ -1282,9 +1327,9 @@ class GtkLatencyUI:
 				self.spin2.set_hexpand(True)
 				self.spin2.connect("value-changed", self.on_spin_changed)
 				
-				# Status label
+				# Status label - FIXED: Show current GTK UI values
 				self.status_label = Gtk.Label(
-					label=f"Current GTK UI values: ASHA={initial_lat1}ms, BT={initial_lat2}ms"
+					label=f"Current GTK UI values: ASHA={ui.current_lat1}ms, BT={ui.current_lat2}ms"
 				)
 				self.status_label.set_halign(Gtk.Align.CENTER)
 				
@@ -1358,16 +1403,17 @@ class GtkLatencyUI:
 				self._pending_changes = False
 				
 				if self.status_label:
+					# FIXED: Show current GTK UI values, not "Applied"
 					self.status_label.set_label(
-						f"Applied: ASHA={lat1}ms, BT={lat2}ms"
+						f"Current GTK UI values: ASHA={lat1}ms, BT={lat2}ms"
 					)
 			
 			def on_reset_to_session_start(self, btn):
 				# Reset to session start values (AUDIO_LAT1/AUDIO_LAT2)
 				if self.spin1:
-					self.spin1.set_value(AUDIO_LAT1)
+					self.spin1.set_value(ui.session_start_lat1)
 				if self.spin2:
-					self.spin2.set_value(AUDIO_LAT2)
+					self.spin2.set_value(ui.session_start_lat2)
 				self._pending_changes = True
 				self.on_apply(btn)  # Auto-apply reset
 			
@@ -1797,6 +1843,11 @@ class SecondaryReconnectionManager:
 			log_reconnection(f"Successfully reconnected to {name}")
 			device_manager.add_connected_device(mac, name)
 			
+			# Reset latencies on secondary reconnection if packet loss adjustment was enabled
+			if PACKETLOSS_ADJUST_ENABLED and PACKETLOSS_ADJUST_CONFIG.get("Reset_After_Reconnect", True):
+				log_audio(f"Secondary device {name} reconnected, resetting latencies to original")
+				reset_latencies_to_original()
+			
 			# Execute GATT operations for the reconnected device
 			log_gatt(f"Executing GATT operations for reconnected secondary device {name}")
 			time.sleep(1)
@@ -1895,6 +1946,90 @@ exit
 
 # Initialize secondary reconnection manager
 secondary_reconnection_manager = SecondaryReconnectionManager()
+
+# ------------------------------
+# PACKET LOSS ADJUSTMENT FUNCTIONS
+# ------------------------------
+def adjust_latency_for_packet_loss():
+	"""Adjust audio latency in response to packet loss - GETS ACTUAL CURRENT LATENCIES"""
+	global packet_loss_count, latency_adjusted, original_lat1, original_lat2, AUDIO_LAT1, AUDIO_LAT2
+	
+	if not PACKETLOSS_ADJUST_ENABLED:
+		return False
+	
+	# Check if we've reached the threshold
+	threshold = PACKETLOSS_ADJUST_CONFIG.get("Threshold", 3)
+	if packet_loss_count >= threshold:
+		log_audio(f"Packet loss threshold reached ({packet_loss_count} events), adjusting latency")
+		
+		# GET ACTUAL CURRENT LATENCIES from audio combiner manager if available
+		if audio_combiner_manager and audio_combiner_started.is_set():
+			current_lat1, current_lat2 = audio_combiner_manager.get_latencies()
+		else:
+			current_lat1, current_lat2 = AUDIO_LAT1, AUDIO_LAT2
+		
+		# Determine which sink to adjust
+		affect_sink = PACKETLOSS_ADJUST_CONFIG.get("Affect_Sink", "asha")
+		adjust_step = PACKETLOSS_ADJUST_CONFIG.get("Adjust_Step", 5)
+		max_latency = PACKETLOSS_ADJUST_CONFIG.get("Max_Latency", 200)
+		
+		# Calculate new latencies
+		new_lat1, new_lat2 = current_lat1, current_lat2
+		
+		if affect_sink in ["asha", "both"]:
+			new_lat1 = min(current_lat1 + adjust_step, max_latency)
+			
+		if affect_sink in ["bt", "both"]:
+			new_lat2 = min(current_lat2 + adjust_step, max_latency)
+		
+		# Apply new latencies if they changed
+		if new_lat1 != current_lat1 or new_lat2 != current_lat2:
+			# Update global latencies
+			AUDIO_LAT1, AUDIO_LAT2 = new_lat1, new_lat2
+			
+			# Update audio combiner if running
+			if audio_combiner_manager and audio_combiner_started.is_set():
+				audio_combiner_manager.set_latencies(new_lat1, new_lat2)
+				log_audio(f"Packet loss auto-adjusted latencies: ASHA={new_lat1}ms, BT={new_lat2}ms")
+			
+			latency_adjusted = True
+			last_packet_loss_time = time.time()
+			
+			# DO NOT UPDATE GTK UI INPUTS - keep them independent
+			log_audio("NOTE: GTK UI inputs remain independent - auto-adjustment only affects audio system")
+			
+			return True
+	
+	return False
+
+def reset_latencies_to_original():
+	"""Reset latencies to original values"""
+	global latency_adjusted, packet_loss_count, AUDIO_LAT1, AUDIO_LAT2, original_lat1, original_lat2
+	
+	if latency_adjusted:
+		log_audio(f"Resetting latencies to original values: ASHA={original_lat1}ms, BT={original_lat2}ms")
+		
+		# Reset global latencies
+		AUDIO_LAT1, AUDIO_LAT2 = original_lat1, original_lat2
+		
+		# Update audio combiner if running
+		if audio_combiner_manager and audio_combiner_started.is_set():
+			audio_combiner_manager.set_latencies(original_lat1, original_lat2)
+		
+		latency_adjusted = False
+		packet_loss_count = 0
+
+def reset_packet_loss_tracking():
+	"""Reset packet loss tracking when conditions improve"""
+	global packet_loss_count, last_packet_loss_time
+	
+	current_time = time.time()
+	
+	# Reset count if no packet loss for a while
+	if current_time - last_packet_loss_time > 10:  # 10 seconds without packet loss
+		if packet_loss_count > 0:
+			log_debug(f"Resetting packet loss count (no packet loss for 10s)")
+			packet_loss_count = 0
 
 # ------------------------------
 # DEVICE MANAGEMENT CLASS
@@ -2263,6 +2398,7 @@ class BluetoothAshaManager:
 		
 		# Set volume value (already determined by priority order)
 		self.volume_value = FINAL_VOLUME_VALUE
+		
 		log_info(f"Final volume value: {self.volume_value}", Fore.GREEN)
 
 		# Set operation mode (already determined by priority order)
@@ -2827,34 +2963,12 @@ exit
 				return True
 			return False
 
-		def mean_std(buf):
-			if not isinstance(buf, (list, tuple)):
-				buf = [buf]
-			n = len(buf)
-			if n == 0:
-				return 0.0, 0.0
-			mean_val = sum(buf) / n
-			total = 0.0
-			for v in buf:
-				diff = v - mean_val
-				total += diff * diff
-			var = total / n
-			x = var
-			if x <= 0.0:
-				return mean_val, 0.0
-			approx = x
-			for _ in range(8):
-				approx = 0.5 * (approx + x / approx)
-			std = approx
-			return mean_val, std
-
-		def detect_loss(x, y, z, max_history=50, tolerance=10.0, min_samples=10, drift_limit=0.10):
-			if not isinstance(x, (list, tuple)):
-				x = [x]
-			if not isinstance(y, (list, tuple)):
-				y = [y]
-			if not isinstance(z, (list, tuple)):
-				z = [z]
+		def detect_loss(x, y, z, max_history=50, min_samples=10, spike_threshold=5.0, flatline_epsilon=1e-6, drift_limit=0.10):
+			# Require persistent buffers
+			if not isinstance(x, (list, tuple)) or \
+			   not isinstance(y, (list, tuple)) or \
+			   not isinstance(z, (list, tuple)):
+				raise TypeError("x, y, z must be history buffers (list or tuple)")
 
 			clr_history(x, max_history)
 			clr_history(y, max_history)
@@ -2863,40 +2977,47 @@ exit
 			if len(x) < min_samples or len(y) < min_samples or len(z) < min_samples:
 				return False
 
-			mean_x, std_x = mean_std(x)
-			mean_y, std_y = mean_std(y)
-			mean_z, std_z = mean_std(z)
-
-			last_vals = [x[-1], y[-1], z[-1]]
-			means = [mean_x, mean_y, mean_z]
-			stds = [std_x, std_y, std_z]
-
-			z_scores = []
-			for v, m, s in zip(last_vals, means, stds):
-				diff = abs(v - m)
-				z = 0.0 if s < 1e-6 else diff / s
-				z_scores.append(z)
-
+			# ---------- helpers ----------
 			def rate(buf):
-				if not isinstance(buf, (list, tuple)) or len(buf) < 2:
-					return 0.0
 				return abs(buf[-1] - buf[-2])
 
+			def flatline(buf):
+				for i in range(1, len(buf)):
+					if abs(buf[i] - buf[0]) > flatline_epsilon:
+						return False
+				return True
+
+			# ---------- rate of change ----------
 			dx = rate(x)
 			dy = rate(y)
 			dz = rate(z)
 			avg_rate = (dx + dy + dz) / 3.0
 
-			# Ignore silent drift (no movement)
+			# ---------- 1. detect frozen stream ----------
+			# packet loss often causes repeated identical samples
+			if flatline(x) and flatline(y) and flatline(z):
+				return True
+
+			# ---------- 2. ignore true silence ----------
 			if avg_rate < drift_limit:
 				return False
 
-			# Spike or sudden deviation = likely packet loss
-			if all(zv > tolerance for zv in z_scores):
+			# ---------- 3. sudden jump detection ----------
+			spikes = 0
+			if dx > spike_threshold:
+				spikes += 1
+			if dy > spike_threshold:
+				spikes += 1
+			if dz > spike_threshold:
+				spikes += 1
+
+			# majority vote instead of all-or-nothing
+			if spikes >= 2:
 				return True
 
 			return False
 
+		
 		# Updated regex to optionally capture Rssi: <val>, <val>
 		ring_regex = re.compile(
 			r"Ring Occupancy:\s*(\d+)\s+High:\s*(\d+)\s+Ring Dropped:\s*(\d+)\s+Total:\s*(\d+)\s+"
@@ -2926,6 +3047,35 @@ exit
 					while b"\n" in buffer:
 						line, buffer = buffer.split(b"\n", 1)
 						decoded = line.decode(errors="ignore")
+						
+						# CRITICAL FIX: Check for secondary device removal
+						if "Removing bluetooth device" in decoded:
+							# Extract device name from the log message
+							device_match = re.search(r"Removing bluetooth device\s+(.+)", decoded)
+							if device_match:
+								device_name = device_match.group(1).strip()
+								log_device(f"ASHA detected device removal: {device_name}")
+								
+								# Check if this is a secondary device
+								device_type = self.device_manager.get_device_type(device_name)
+								if device_type == "secondary":
+									log_warning(f"ASHA detected secondary device {device_name} removal - stopping audio combiner")
+									
+									# Find the MAC address of the secondary device
+									secondary_mac = None
+									with global_lock:
+										for mac, data in connected_devices.items():
+											if data['name'] == device_name:
+												secondary_mac = mac
+												break
+									
+									if secondary_mac:
+										# Remove the secondary device (this will stop audio combiner)
+										self.device_manager.remove_connected_device(secondary_mac, self.secondary_reconnect_enabled)
+										log_audio(f"Audio combiner stopped due to secondary device {device_name} removal")
+									else:
+										log_warning(f"Could not find MAC for disconnected device {device_name}")
+						
 						if "Ring Occupancy:" in decoded:
 							match = ring_regex.search(decoded)
 							if match:
@@ -2980,8 +3130,26 @@ exit
 									buffer_z = safe_append(buffer_z, current_stats['Silence'])
 
 									if detect_loss(buffer_x, buffer_y, buffer_z):
-										log_warning("ASHA packet loss detected (auto reconnect)")
-										if self.args.reconnect:
+										global packet_loss_count, last_packet_loss_time
+										# Increment packet loss counter
+										packet_loss_count += 1
+										last_packet_loss_time = time.time()
+										
+										log_warning(f"ASHA packet loss detected (count: {packet_loss_count})")
+										
+										# Try adjusting latency first if configured
+										if PACKETLOSS_ADJUST_ENABLED:
+											if adjust_latency_for_packet_loss():
+												# Latency was adjusted, don't trigger reconnect immediately
+												# Continue monitoring to see if adjustment helps
+												log_info("Latency adjusted for packet loss, monitoring...")
+												# Reset counter after adjustment to track new events
+												packet_loss_count = 0
+												continue  # Skip reconnect for now
+										
+										# If latency adjustment not enabled or didn't help, trigger reconnect if set
+										if self.args.reconnect and config["GATT"]["Detect_loss_reconnect"]:
+											log_warning("Packet loss threshold reached, triggering reconnect")
 											# Remove all connected devices on ASHA failure
 											connected_devices_info = self.device_manager.get_connected_devices_info()
 											for mac, name, _ in connected_devices_info:
@@ -2989,6 +3157,10 @@ exit
 											reconnect_evt.set()
 											asha_restart_evt.set()
 								
+								# Periodically reset packet loss tracking when conditions are good
+								if time.time() % 30 < 1:  # Every ~30 seconds
+									reset_packet_loss_tracking()
+							
 							else:
 								log_debug(f"[ASHA] {decoded}")
 						else:
