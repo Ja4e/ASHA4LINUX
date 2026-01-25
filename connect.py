@@ -125,6 +125,233 @@ colorama_init(autoreset=True)
 global_lock = threading.RLock()
 
 # ------------------------------
+# LOCK FILE MANAGEMENT
+# ------------------------------
+LOCK_FILE_PATH = os.path.expanduser("~/.config/asha_manager/process.lock")
+
+class ProcessLockManager:
+	"""Manages lock file to prevent multiple instances and clean up leftover resources"""
+	
+	def __init__(self, lock_file_path: str = LOCK_FILE_PATH):
+		self.lock_file_path = lock_file_path
+		self.lock_data = {
+			"pid": os.getpid(),
+			"loopback_ids": [],
+			"module_ids": [],
+			"start_time": time.time()
+		}
+		self.lock_held = False
+		
+	def check_and_cleanup_old_lock(self) -> bool:
+		"""Check if lock file exists and clean up if old process is dead"""
+		if not os.path.exists(self.lock_file_path):
+			return True
+			
+		try:
+			with open(self.lock_file_path, 'r') as f:
+				old_lock_data = json.load(f)
+			
+			old_pid = old_lock_data.get("pid")
+			
+			# Check if old process is still running
+			if old_pid and self._is_process_running(old_pid):
+				log_error(f"Another instance is running (PID: {old_pid}). Exiting.")
+				return False
+			else:
+				# Old process is dead, clean up its resources
+				log_warning(f"Cleaning up leftover resources from dead process (PID: {old_pid})")
+				self._cleanup_leftover_resources(old_lock_data)
+				
+				# Remove old lock file
+				os.remove(self.lock_file_path)
+				log_info("Old lock file removed and resources cleaned up")
+				return True
+				
+		except (json.JSONDecodeError, IOError) as e:
+			log_warning(f"Could not read lock file: {e}, attempting cleanup")
+			self._force_cleanup_audio_modules()
+			try:
+				os.remove(self.lock_file_path)
+			except:
+				pass
+			return True
+	
+	def _is_process_running(self, pid: int) -> bool:
+		"""Check if a process with given PID is running"""
+		try:
+			os.kill(pid, 0)  # This doesn't kill the process, just checks if it exists
+			return True
+		except OSError:
+			return False
+	
+	def _cleanup_leftover_resources(self, lock_data: Dict) -> None:
+		"""Clean up leftover audio modules and processes"""
+		# Clean up loopback modules
+		for loopback_id in lock_data.get("loopback_ids", []):
+			if loopback_id:
+				log_info(f"Cleaning up leftover loopback module: {loopback_id}")
+				run_cmd(['pactl', 'unload-module', str(loopback_id)], check=False)
+				time.sleep(0.05)
+		
+		# Clean up null sink modules
+		for module_id in lock_data.get("module_ids", []):
+			if module_id:
+				log_info(f"Cleaning up leftover null sink module: {module_id}")
+				run_cmd(['pactl', 'unload-module', str(module_id)], check=False)
+				time.sleep(0.05)
+		
+		# Kill any ASHA processes
+		kill_existing_asha_processes()
+		
+		# Clean up any combined sink modules
+		modules = run_cmd(['pactl', 'list', 'short', 'modules'], capture=True)
+		if modules:
+			for line in modules.splitlines():
+				if 'module-combine-sink' in line or 'module-null-sink' in line or 'module-loopback' in line:
+					parts = line.split()
+					if parts and parts[0]:
+						module_id = parts[0]
+						# Skip if this is in our current lock data (we'll create it fresh)
+						if module_id not in lock_data.get("module_ids", []) and module_id not in lock_data.get("loopback_ids", []):
+							log_info(f"Cleaning up orphaned module: {module_id}")
+							run_cmd(['pactl', 'unload-module', module_id], check=False)
+							time.sleep(0.05)
+	
+	def _force_cleanup_audio_modules(self) -> None:
+		"""Force cleanup of all audio modules that might be leftover"""
+		log_warning("Performing force cleanup of audio modules")
+		
+		# Get all modules
+		modules = run_cmd(['pactl', 'list', 'short', 'modules'], capture=True)
+		if not modules:
+			return
+			
+		module_ids_to_clean = []
+		for line in modules.splitlines():
+			if 'module-combine-sink' in line or 'module-null-sink' in line or 'module-loopback' in line:
+				parts = line.split()
+				if parts and parts[0]:
+					module_ids_to_clean.append(parts[0])
+		
+		# Unload modules
+		for module_id in module_ids_to_clean:
+			log_info(f"Force cleaning module: {module_id}")
+			run_cmd(['pactl', 'unload-module', module_id], check=False)
+			time.sleep(0.05)
+	
+	def acquire_lock(self) -> bool:
+		"""Acquire lock by creating lock file"""
+		if self.lock_held:
+			return True
+			
+		if not self.check_and_cleanup_old_lock():
+			return False
+			
+		try:
+			# Create directory if it doesn't exist
+			os.makedirs(os.path.dirname(self.lock_file_path), exist_ok=True)
+			
+			# Write lock file
+			with open(self.lock_file_path, 'w') as f:
+				json.dump(self.lock_data, f, indent=2)
+			
+			self.lock_held = True
+			log_info(f"Lock acquired (PID: {self.lock_data['pid']})")
+			return True
+			
+		except Exception as e:
+			log_error(f"Failed to acquire lock: {e}")
+			return False
+	
+	def update_lock(self, loopback_ids: List[str] = None, module_ids: List[str] = None) -> None:
+		"""Update lock file with current resource IDs"""
+		if not self.lock_held:
+			return
+			
+		try:
+			with global_lock:
+				if loopback_ids is not None:
+					self.lock_data["loopback_ids"] = loopback_ids
+				if module_ids is not None:
+					self.lock_data["module_ids"] = module_ids
+				
+				with open(self.lock_file_path, 'w') as f:
+					json.dump(self.lock_data, f, indent=2)
+					
+		except Exception as e:
+			log_error(f"Failed to update lock file: {e}")
+	
+	def add_loopback_id(self, loopback_id: str) -> None:
+		"""Add a loopback ID to lock file"""
+		if not self.lock_held or not loopback_id:
+			return
+			
+		with global_lock:
+			if loopback_id not in self.lock_data["loopback_ids"]:
+				self.lock_data["loopback_ids"].append(loopback_id)
+				self._write_lock_file()
+	
+	def remove_loopback_id(self, loopback_id: str) -> None:
+		"""Remove a loopback ID from lock file"""
+		if not self.lock_held:
+			return
+			
+		with global_lock:
+			if loopback_id in self.lock_data["loopback_ids"]:
+				self.lock_data["loopback_ids"].remove(loopback_id)
+				self._write_lock_file()
+	
+	def add_module_id(self, module_id: str) -> None:
+		"""Add a module ID to lock file"""
+		if not self.lock_held or not module_id:
+			return
+			
+		with global_lock:
+			if module_id not in self.lock_data["module_ids"]:
+				self.lock_data["module_ids"].append(module_id)
+				self._write_lock_file()
+	
+	def remove_module_id(self, module_id: str) -> None:
+		"""Remove a module ID from lock file"""
+		if not self.lock_held:
+			return
+			
+		with global_lock:
+			if module_id in self.lock_data["module_ids"]:
+				self.lock_data["module_ids"].remove(module_id)
+				self._write_lock_file()
+	
+	def _write_lock_file(self) -> None:
+		"""Write lock file atomically"""
+		try:
+			# Write to temp file first
+			temp_file = self.lock_file_path + ".tmp"
+			with open(temp_file, 'w') as f:
+				json.dump(self.lock_data, f, indent=2)
+			
+			# Rename to actual lock file
+			os.replace(temp_file, self.lock_file_path)
+			
+		except Exception as e:
+			log_error(f"Failed to write lock file: {e}")
+	
+	def release_lock(self) -> None:
+		"""Release lock by removing lock file"""
+		if not self.lock_held:
+			return
+			
+		try:
+			if os.path.exists(self.lock_file_path):
+				os.remove(self.lock_file_path)
+			self.lock_held = False
+			log_info("Lock released")
+		except Exception as e:
+			log_error(f"Failed to release lock: {e}")
+
+# Global lock manager
+lock_manager = ProcessLockManager()
+
+# ------------------------------
 # Logging Setup
 # ------------------------------
 DEBUG: bool = os.getenv('DEBUG', '0') == '1'
@@ -266,7 +493,14 @@ def cleanup_before_exit():
 	except Exception as e:
 		log_error(f"Error killing ASHA processes: {e}")
 	
-	# 7. Force garbage collection
+	try:
+		# 7. Release the process lock
+		log_info("Releasing process lock...", Fore.YELLOW)
+		lock_manager.release_lock()
+	except Exception as e:
+		log_error(f"Error releasing lock: {e}")
+	
+	# 8. Force garbage collection
 	gc.collect()
 	
 	log_info("Cleanup complete. Exiting...", Fore.GREEN)
@@ -937,6 +1171,7 @@ class Sink:
 		], capture=True)
 		if module_id:
 			self.module_id = module_id
+			lock_manager.add_module_id(module_id)
 			log_audio(f"Created null sink {self.name} (module {module_id})")
 		else:
 			log_error(f"Failed to create null sink {self.name}")
@@ -966,6 +1201,7 @@ class Sink:
 		module_id = run_cmd(self._build_loopback_cmd(), capture=True)
 		if module_id:
 			self.loopback_id = module_id
+			lock_manager.add_loopback_id(module_id)
 			log_audio(f"Created loopback {self.name} -> {self.target} (module {module_id}) latency={self.latency}ms")
 		else:
 			log_error(f"Failed to create loopback for {self.name} -> {self.target}")
@@ -974,6 +1210,10 @@ class Sink:
 	def cleanup_loopback(self) -> None:
 		if not self.loopback_id:
 			return
+		
+		# Remove from lock file before cleanup
+		lock_manager.remove_loopback_id(self.loopback_id)
+		
 		for attempt in range(3):
 			run_cmd(['pactl', 'unload-module', self.loopback_id], check=False)
 			time.sleep(0.05 * (attempt + 1))
@@ -1010,6 +1250,8 @@ class Sink:
 		except Exception as e:
 			log_debug("cleanup_loopback error: %s", e)
 		if self.module_id:
+			# Remove from lock file before cleanup
+			lock_manager.remove_module_id(self.module_id)
 			run_cmd(['pactl', 'unload-module', self.module_id], check=False)
 			self.module_id = None
 		if self.orig_volume:
@@ -1034,6 +1276,7 @@ class CombinedSink:
 			f'sink_properties=device.description={self.desc}'
 		], capture=True)
 		if self.module_id:
+			lock_manager.add_module_id(self.module_id)
 			run_cmd(['pactl', 'set-default-sink', self.name], check=False)
 			if volume:
 				run_cmd(['pactl', 'set-sink-volume', self.name, volume], check=False)
@@ -1049,6 +1292,8 @@ class CombinedSink:
 
 	def cleanup(self) -> None:
 		if self.module_id:
+			# Remove from lock file before cleanup
+			lock_manager.remove_module_id(self.module_id)
 			run_cmd(['pactl', 'unload-module', self.module_id], check=False)
 			self.module_id = None
 
@@ -1122,19 +1367,27 @@ class AudioCombinerManager:
 		modules = run_cmd(['pactl', 'list', 'short', 'modules'], capture=True)
 		if not modules:
 			return
-		current_loopbacks = {self.sink1.loopback_id, self.sink2.loopback_id}
+		
+		# Get current IDs from lock manager to avoid cleaning up our own modules
+		with global_lock:
+			current_loopbacks = set(lock_manager.lock_data.get("loopback_ids", []))
+			current_modules = set(lock_manager.lock_data.get("module_ids", []))
+		
 		for line in modules.splitlines():
-			if 'module-loopback' in line:
+			if 'module-loopback' in line or 'module-null-sink' in line or 'module-combine-sink' in line:
 				parts = line.split()
 				if not parts:
 					continue
 				module_id = parts[0]
-				if module_id in current_loopbacks:
+				
+				# Skip our own modules
+				if module_id in current_loopbacks or module_id in current_modules:
 					continue
-				if self.sink1.name in line or self.sink2.name in line:
-					log_warning(f"Unloading zombie loopback module {module_id}")
-					run_cmd(['pactl', 'unload-module', module_id], check=False)
-					time.sleep(0.02)
+				
+				# Check if this is a zombie module (no longer in our lock file)
+				log_warning(f"Unloading zombie audio module {module_id}")
+				run_cmd(['pactl', 'unload-module', module_id], check=False)
+				time.sleep(0.02)
 	
 	def monitor_loop(self) -> None:
 		"""Monitor audio sinks and adjust as needed"""
@@ -1286,6 +1539,7 @@ class AudioCombinerManager:
 		try:
 			# Unload combined sink module
 			if self.comb_sink.module_id:
+				lock_manager.remove_module_id(self.comb_sink.module_id)
 				run_cmd(['pactl', 'unload-module', self.comb_sink.module_id], check=False)
 				self.comb_sink.module_id = None
 		except Exception as e:
@@ -1294,6 +1548,7 @@ class AudioCombinerManager:
 		try:
 			# Unload loopbacks
 			if self.sink1.loopback_id:
+				lock_manager.remove_loopback_id(self.sink1.loopback_id)
 				run_cmd(['pactl', 'unload-module', self.sink1.loopback_id], check=False)
 				self.sink1.loopback_id = None
 		except Exception as e:
@@ -1301,6 +1556,7 @@ class AudioCombinerManager:
 		
 		try:
 			if self.sink2.loopback_id:
+				lock_manager.remove_loopback_id(self.sink2.loopback_id)
 				run_cmd(['pactl', 'unload-module', self.sink2.loopback_id], check=False)
 				self.sink2.loopback_id = None
 		except Exception as e:
@@ -1309,6 +1565,7 @@ class AudioCombinerManager:
 		try:
 			# Unload null sinks
 			if self.sink1.module_id:
+				lock_manager.remove_module_id(self.sink1.module_id)
 				run_cmd(['pactl', 'unload-module', self.sink1.module_id], check=False)
 				self.sink1.module_id = None
 		except Exception as e:
@@ -1316,6 +1573,7 @@ class AudioCombinerManager:
 		
 		try:
 			if self.sink2.module_id:
+				lock_manager.remove_module_id(self.sink2.module_id)
 				run_cmd(['pactl', 'unload-module', self.sink2.module_id], check=False)
 				self.sink2.module_id = None
 		except Exception as e:
@@ -3802,6 +4060,11 @@ signal.signal(signal.SIGTERM, signal_handler)
 def main() -> None:
 	"""Main entry point with argument parsing"""
 	global device_manager
+	
+	# Check and acquire lock before proceeding
+	if not lock_manager.acquire_lock():
+		log_error("Failed to acquire lock. Another instance may be running or lock file is corrupted.")
+		sys.exit(1)
 	
 	parser = create_parser()
 	parser.add_argument('-h', '--help', action='help', help='Show this help message and exit')
