@@ -239,7 +239,7 @@ def load_config(config_path: str) -> dict:
 					"Duration_s": 0.3,
 				},
 				"Frequency_int": 1,
-				"Detect_loss": False,
+				"Detect_loss": True,
 				"Detect_loss_reconnect": False,
 				"Per_Device_Volume": True
 			},
@@ -285,7 +285,7 @@ def load_config(config_path: str) -> dict:
 				"Monitor_Interval": 1.0,
 				# NEW: Packet loss detection with latency adjustment
 				"PacketLoss_Adjust": {
-					"Enabled": True,  # Enable/disable auto-adjustment on packet loss
+					"Enabled": False,  # Enable/disable auto-adjustment on packet loss
 					"Threshold": 3,    # Number of consecutive packet loss detections before adjusting
 					"Adjust_Step": 30,  # How much to increase latency by (ms)
 					"Max_Latency": 124, # Maximum latency to avoid going too high
