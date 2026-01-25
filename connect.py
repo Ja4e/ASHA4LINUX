@@ -115,6 +115,7 @@ import termios
 import json
 import psutil
 import queue
+import gc
 
 colorama_init(autoreset=True)
 
@@ -201,6 +202,74 @@ def log_audio(message: str) -> None:
 def log_gtk(message: str) -> None:
 	"""Consistent GTK UI logging"""
 	logger.info(f"{Fore.CYAN}[GTK] {message}{Style.RESET_ALL}")
+
+# ------------------------------
+# COMPREHENSIVE CLEANUP FUNCTION
+# ------------------------------
+def cleanup_before_exit():
+	"""Comprehensive cleanup before script exit"""
+	log_info("=== COMPREHENSIVE CLEANUP BEFORE EXIT ===", Fore.RED)
+	
+	# Set shutdown event to signal all threads
+	shutdown_evt.set()
+	
+	try:
+		# 1. Stop GTK UI first (if running)
+		log_info("Stopping GTK UI...", Fore.YELLOW)
+		stop_gtk_ui()
+		
+		# Wait a bit for GTK UI to close
+		time.sleep(0.5)
+	except Exception as e:
+		log_error(f"Error stopping GTK UI: {e}")
+	
+	try:
+		# 2. Stop audio combiner with force flag
+		log_info("Stopping audio combiner...", Fore.YELLOW)
+		if audio_combiner_manager and audio_combiner_started.is_set():
+			# Use a stronger stop method that forces cleanup
+			audio_combiner_manager.force_stop()
+		audio_combiner_stop.set()
+		audio_combiner_started.clear()
+		
+		# Wait for audio combiner threads
+		if audio_combiner_thread and audio_combiner_thread.is_alive():
+			audio_combiner_thread.join(timeout=1.0)
+	except Exception as e:
+		log_error(f"Error stopping audio combiner: {e}")
+	
+	try:
+		# 3. Stop secondary reconnection manager
+		log_info("Stopping secondary reconnection manager...", Fore.YELLOW)
+		secondary_reconnection_manager.stop_all_reconnections()
+	except Exception as e:
+		log_error(f"Error stopping reconnection manager: {e}")
+	
+	try:
+		# 4. Cancel connection delay timer
+		log_info("Cancelling connection delay timer...", Fore.YELLOW)
+		connection_delay_manager.reset_delay()
+	except Exception as e:
+		log_error(f"Error cancelling delay timer: {e}")
+	
+	try:
+		# 5. Stop async event loop
+		log_info("Stopping async event loop...", Fore.YELLOW)
+		async_manager.stop()
+	except Exception as e:
+		log_error(f"Error stopping async event loop: {e}")
+	
+	try:
+		# 6. Kill any remaining ASHA processes
+		log_info("Killing any remaining ASHA processes...", Fore.YELLOW)
+		kill_existing_asha_processes()
+	except Exception as e:
+		log_error(f"Error killing ASHA processes: {e}")
+	
+	# 7. Force garbage collection
+	gc.collect()
+	
+	log_info("Cleanup complete. Exiting...", Fore.GREEN)
 
 # ------------------------------
 # CONFIGURATION
@@ -1206,6 +1275,61 @@ class AudioCombinerManager:
 		except Exception as e:
 			log_debug(f"Failed to update GTK UI label in force_reapply_latencies: {e}")
 
+	def force_stop(self):
+		"""Force stop the audio combiner, ensuring all resources are cleaned up"""
+		log_audio("Force stopping audio combiner...")
+		
+		# Set stop flags
+		audio_combiner_stop.set()
+		
+		# Unload all modules directly
+		try:
+			# Unload combined sink module
+			if self.comb_sink.module_id:
+				run_cmd(['pactl', 'unload-module', self.comb_sink.module_id], check=False)
+				self.comb_sink.module_id = None
+		except Exception as e:
+			log_debug(f"Error unloading comb sink: {e}")
+		
+		try:
+			# Unload loopbacks
+			if self.sink1.loopback_id:
+				run_cmd(['pactl', 'unload-module', self.sink1.loopback_id], check=False)
+				self.sink1.loopback_id = None
+		except Exception as e:
+			log_debug(f"Error unloading sink1 loopback: {e}")
+		
+		try:
+			if self.sink2.loopback_id:
+				run_cmd(['pactl', 'unload-module', self.sink2.loopback_id], check=False)
+				self.sink2.loopback_id = None
+		except Exception as e:
+			log_debug(f"Error unloading sink2 loopback: {e}")
+		
+		try:
+			# Unload null sinks
+			if self.sink1.module_id:
+				run_cmd(['pactl', 'unload-module', self.sink1.module_id], check=False)
+				self.sink1.module_id = None
+		except Exception as e:
+			log_debug(f"Error unloading sink1: {e}")
+		
+		try:
+			if self.sink2.module_id:
+				run_cmd(['pactl', 'unload-module', self.sink2.module_id], check=False)
+				self.sink2.module_id = None
+		except Exception as e:
+			log_debug(f"Error unloading sink2: {e}")
+		
+		# Stop monitor thread
+		if self.monitor_thread and self.monitor_thread.is_alive():
+			self.monitor_thread.join(timeout=1.0)
+		
+		# Clear global reference
+		global audio_combiner_manager
+		audio_combiner_manager = None
+		
+		log_audio("Audio combiner force stopped")
 
 	def start(self) -> bool:
 		"""Start the audio combiner"""
@@ -1498,7 +1622,6 @@ class GtkLatencyUI:
 		# Run the application
 		app.run(None)
 
-
 def start_gtk_ui():
 	"""Start GTK UI in a separate thread"""
 	global gtk_ui_thread
@@ -1529,9 +1652,30 @@ def stop_gtk_ui():
 	"""Stop GTK UI"""
 	global gtk_ui_thread
 	gtk_ui_stop.set()
+	
+	# Force GTK main loop to quit
+	try:
+		import gi
+		gi.require_version("Gtk", "4.0")
+		from gi.repository import Gtk
+		
+		# Close any open windows
+		for window in Gtk.Window.list_toplevels():
+			try:
+				window.close()
+				window.destroy()
+			except:
+				pass
+	except:
+		pass
+	
 	if gtk_ui_thread and gtk_ui_thread.is_alive():
 		gtk_ui_thread.join(timeout=2.0)
 		gtk_ui_thread = None
+	
+	# Force garbage collection
+	gc.collect()
+	
 	log_gtk("GTK UI stopped")
 
 # ------------------------------
@@ -2067,7 +2211,6 @@ def adjust_latency_for_packet_loss():
 
 	return True
 
-
 def reset_packet_loss_tracking():
 	"""Reset packet loss tracking when conditions improve"""
 	global packet_loss_count, last_packet_loss_time, last_latency_adjust_loss  # ADDED: last_latency_adjust_loss
@@ -2080,7 +2223,6 @@ def reset_packet_loss_tracking():
 			log_debug(f"Resetting packet loss count (no packet loss for 10s)")
 			packet_loss_count = 0
 			last_latency_adjust_loss = 0  # Also reset the adjust tracking
-
 
 def reset_latencies_to_original():
 	"""Reset latencies to original values"""
@@ -2098,18 +2240,6 @@ def reset_latencies_to_original():
 		
 		latency_adjusted = False
 		packet_loss_count = 0
-
-def reset_packet_loss_tracking():
-	"""Reset packet loss tracking when conditions improve"""
-	global packet_loss_count, last_packet_loss_time
-	
-	current_time = time.time()
-	
-	# Reset count if no packet loss for a while
-	if current_time - last_packet_loss_time > 10:  # 10 seconds without packet loss
-		if packet_loss_count > 0:
-			log_debug(f"Resetting packet loss count (no packet loss for 10s)")
-			packet_loss_count = 0
 
 # ------------------------------
 # DEVICE MANAGEMENT CLASS
@@ -3546,7 +3676,6 @@ exit
 			run_command("bluetoothctl pairable off", check=False)
 			if not shutdown_evt.is_set():
 				shutdown_evt.set()
-			async_manager.stop()
 			log_info("Cleanup complete", Fore.GREEN)
 		else:
 			log_info("Partial cleanup complete (GTK UI and audio combiner preserved)", Fore.GREEN)
@@ -3654,7 +3783,22 @@ exit
 		finally:
 			self.cleanup()
 
-# Main entry point
+# ------------------------------
+# SIGNAL HANDLER
+# ------------------------------
+def signal_handler(signum, frame):
+	"""Handle termination signals"""
+	log_warning(f"Received signal {signum}, cleaning up...")
+	cleanup_before_exit()
+	sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# ------------------------------
+# MAIN ENTRY POINT
+# ------------------------------
 def main() -> None:
 	"""Main entry point with argument parsing"""
 	global device_manager
@@ -3676,11 +3820,26 @@ def main() -> None:
 		manager.run()
 	except KeyboardInterrupt:
 		log_info("Shutdown requested by user")
-		manager.cleanup()
 	except Exception as e:
 		log_error(f"Fatal error: {e}")
-		manager.cleanup()
 		sys.exit(1)
+	finally:
+		# ALWAYS run comprehensive cleanup
+		try:
+			log_info("Running final cleanup...", Fore.YELLOW)
+			cleanup_before_exit()
+		except Exception as e:
+			log_error(f"Error during final cleanup: {e}")
+		
+		# Additional sleep to ensure everything is cleaned up
+		time.sleep(0.2)
+		
+		# Check for any remaining threads
+		threads = threading.enumerate()
+		if len(threads) > 1:  # More than just main thread
+			log_warning(f"Remaining threads: {[t.name for t in threads if t != threading.main_thread()]}")
+		
+		log_info("Script exited cleanly", Fore.GREEN)
 
 if __name__ == "__main__":
 	main()
