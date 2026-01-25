@@ -1113,49 +1113,100 @@ class AudioCombinerManager:
 		log_audio("Audio combiner monitor loop stopped")
 	
 	def set_latencies(self, lat1_ms: int, lat2_ms: int, force_update: bool = True) -> None:
-		"""Update audio sink latencies - completely independent from config"""
-		# Only update if values actually changed
-		if self.current_lat1 == lat1_ms and self.current_lat2 == lat2_ms and not force_update:
+		"""Update audio sink latencies - authoritative and live"""
+
+		lat1_ms = int(lat1_ms)
+		lat2_ms = int(lat2_ms)
+
+		# Skip only if explicitly allowed
+		if (
+			self.current_lat1 == lat1_ms and
+			self.current_lat2 == lat2_ms and
+			not force_update
+		):
 			log_debug("Latencies unchanged, skipping update")
 			return
-			
+
 		log_audio(f"Updating latencies: sink1={lat1_ms}ms sink2={lat2_ms}ms")
-		
-		# Update current latencies
-		self.current_lat1 = int(lat1_ms)
-		self.current_lat2 = int(lat2_ms)
-		
-		# Update sink latencies
+
+		# ---- authoritative runtime state ----
+		self.current_lat1 = lat1_ms
+		self.current_lat2 = lat2_ms
+
+		# Sink objects must always carry authoritative latency
 		self.sink1.latency = self.current_lat1
 		self.sink2.latency = self.current_lat2
-		
-		# DO NOT update config dictionary
-		# DO NOT call save_config()
-		# DO NOT update environment variables
-		
-		# Update GTK UI global variables (for GTK UI display only)
+
+		# ---- GTK UI: CURRENT VALUES ONLY (not inputs) ----
 		global GTK_UI_LAT1, GTK_UI_LAT2
 		GTK_UI_LAT1 = self.current_lat1
 		GTK_UI_LAT2 = self.current_lat2
-		
-		# Only recreate loopbacks if they exist
+
+		# ---- HARD reapply to live audio graph ----
+		# Tear down and recreate loopbacks with authoritative latency
 		if self.sink1.loopback_id:
 			self.sink1.cleanup_loopback()
 			self.sink1.create_loopback()
-		
+
 		if self.sink2.loopback_id:
 			self.sink2.cleanup_loopback()
 			self.sink2.create_loopback()
-		
-		# Update combined sink slaves if it exists
+
+		# Reassert combined sink wiring if present
 		if self.comb_sink.module_id:
-			slaves = [self.sink1.name] + ([self.sink2.name] if self.sink2.loopback_id else [])
+			slaves = [self.sink1.name] + (
+				[self.sink2.name] if self.sink2.loopback_id else []
+			)
 			self.comb_sink.update_slaves(slaves)
+
 	
 	def get_latencies(self) -> Tuple[int, int]:
 		"""Get current latencies"""
 		return self.current_lat1, self.current_lat2
 	
+	def force_reapply_latencies(self) -> None:
+		"""
+		Force live audio graph to reapply current latencies.
+		This is authoritative and survives monitor loop recreation.
+		"""
+		log_audio(
+			f"Forcing latency reapply: "
+			f"ASHA={self.current_lat1}ms BT={self.current_lat2}ms"
+		)
+
+		# Update GTK UI CURRENT VALUES ONLY (not inputs)
+		global GTK_UI_LAT1, GTK_UI_LAT2
+		GTK_UI_LAT1 = self.current_lat1
+		GTK_UI_LAT2 = self.current_lat2
+
+		# Tear down and recreate loopbacks with authoritative latency
+		if self.sink1.loopback_id:
+			self.sink1.cleanup_loopback()
+			self.sink1.latency = self.current_lat1
+			self.sink1.create_loopback()
+
+		if self.sink2.loopback_id:
+			self.sink2.cleanup_loopback()
+			self.sink2.latency = self.current_lat2
+			self.sink2.create_loopback()
+
+		# Reassert combined sink wiring
+		if self.comb_sink.module_id:
+			slaves = [self.sink1.name] + (
+				[self.sink2.name] if self.sink2.loopback_id else []
+			)
+			self.comb_sink.update_slaves(slaves)
+
+		# ---- GTK UI live update ----
+		try:
+			if gtk_ui and gtk_ui.running and gtk_ui.status_label:
+				gtk_ui.status_label.set_label(
+					f"Current GTK UI values: ASHA={self.current_lat1}ms, BT={self.current_lat2}ms"
+				)
+		except Exception as e:
+			log_debug(f"Failed to update GTK UI label in force_reapply_latencies: {e}")
+
+
 	def start(self) -> bool:
 		"""Start the audio combiner"""
 		try:
@@ -1440,6 +1491,9 @@ class GtkLatencyUI:
 		ui = self
 		app = LatencyApp()
 		self.app = app
+		
+		global gtk_ui
+		gtk_ui = self  # <-- THIS is where you set the global reference
 		
 		# Run the application
 		app.run(None)
@@ -1947,60 +2001,86 @@ exit
 # Initialize secondary reconnection manager
 secondary_reconnection_manager = SecondaryReconnectionManager()
 
+last_latency_adjust_loss = 0
+
 # ------------------------------
 # PACKET LOSS ADJUSTMENT FUNCTIONS
 # ------------------------------
 def adjust_latency_for_packet_loss():
-	"""Adjust audio latency in response to packet loss - GETS ACTUAL CURRENT LATENCIES"""
-	global packet_loss_count, latency_adjusted, original_lat1, original_lat2, AUDIO_LAT1, AUDIO_LAT2
-	
-	if not PACKETLOSS_ADJUST_ENABLED:
-		return False
-	
-	# Check if we've reached the threshold
-	threshold = PACKETLOSS_ADJUST_CONFIG.get("Threshold", 3)
-	if packet_loss_count >= threshold:
-		log_audio(f"Packet loss threshold reached ({packet_loss_count} events), adjusting latency")
-		
-		# GET ACTUAL CURRENT LATENCIES from audio combiner manager if available
-		if audio_combiner_manager and audio_combiner_started.is_set():
-			current_lat1, current_lat2 = audio_combiner_manager.get_latencies()
-		else:
-			current_lat1, current_lat2 = AUDIO_LAT1, AUDIO_LAT2
-		
-		# Determine which sink to adjust
-		affect_sink = PACKETLOSS_ADJUST_CONFIG.get("Affect_Sink", "asha")
-		adjust_step = PACKETLOSS_ADJUST_CONFIG.get("Adjust_Step", 5)
-		max_latency = PACKETLOSS_ADJUST_CONFIG.get("Max_Latency", 200)
-		
-		# Calculate new latencies
-		new_lat1, new_lat2 = current_lat1, current_lat2
-		
-		if affect_sink in ["asha", "both"]:
-			new_lat1 = min(current_lat1 + adjust_step, max_latency)
-			
-		if affect_sink in ["bt", "both"]:
-			new_lat2 = min(current_lat2 + adjust_step, max_latency)
-		
-		# Apply new latencies if they changed
-		if new_lat1 != current_lat1 or new_lat2 != current_lat2:
-			# Update global latencies
-			AUDIO_LAT1, AUDIO_LAT2 = new_lat1, new_lat2
-			
-			# Update audio combiner if running
-			if audio_combiner_manager and audio_combiner_started.is_set():
-				audio_combiner_manager.set_latencies(new_lat1, new_lat2)
-				log_audio(f"Packet loss auto-adjusted latencies: ASHA={new_lat1}ms, BT={new_lat2}ms")
-			
-			latency_adjusted = True
-			last_packet_loss_time = time.time()
-			
-			# DO NOT UPDATE GTK UI INPUTS - keep them independent
-			log_audio("NOTE: GTK UI inputs remain independent - auto-adjustment only affects audio system")
-			
-			return True
-	
-	return False
+    """
+    Adjust audio latency in response to packet loss.
+    ONLY reacts to packet-loss DELTAS since last adjustment.
+    Stops adjusting once max latency is reached.
+    """
+    global packet_loss_count, latency_adjusted, original_lat1, original_lat2
+    global AUDIO_LAT1, AUDIO_LAT2, last_latency_adjust_loss
+
+    if not PACKETLOSS_ADJUST_ENABLED:
+        return False
+
+    threshold = PACKETLOSS_ADJUST_CONFIG.get("Threshold", 3)
+
+    # -------- DELTA-BASED GATE --------
+    delta_since_adjust = packet_loss_count - last_latency_adjust_loss
+    if delta_since_adjust < threshold:
+        return False
+
+    # GET ACTUAL CURRENT LATENCIES
+    if audio_combiner_manager and audio_combiner_started.is_set():
+        current_lat1, current_lat2 = audio_combiner_manager.get_latencies()
+    else:
+        current_lat1, current_lat2 = AUDIO_LAT1, AUDIO_LAT2
+
+    affect_sink = PACKETLOSS_ADJUST_CONFIG.get("Affect_Sink", "asha")
+    adjust_step = PACKETLOSS_ADJUST_CONFIG.get("Adjust_Step", 5)
+    max_latency = PACKETLOSS_ADJUST_CONFIG.get("Max_Latency", 200)
+
+    new_lat1, new_lat2 = current_lat1, current_lat2
+
+    if affect_sink in ["asha", "both"] and current_lat1 < max_latency:
+        new_lat1 = min(current_lat1 + adjust_step, max_latency)
+
+    if affect_sink in ["bt", "both"] and current_lat2 < max_latency:
+        new_lat2 = min(current_lat2 + adjust_step, max_latency)
+
+    # If both sinks have already hit max, skip adjustment
+    if new_lat1 == current_lat1 and new_lat2 == current_lat2:
+        last_latency_adjust_loss = packet_loss_count
+        log_audio(f"Max latency reached (ASHA={current_lat1}ms, BT={current_lat2}ms), no adjustment applied")
+        return False
+
+    AUDIO_LAT1, AUDIO_LAT2 = new_lat1, new_lat2
+
+    if audio_combiner_manager and audio_combiner_started.is_set():
+        audio_combiner_manager.set_latencies(new_lat1, new_lat2, force_update=True)
+
+    last_latency_adjust_loss = packet_loss_count
+    latency_adjusted = True
+
+    log_audio(
+        f"Packet loss auto-adjusted latencies: "
+        f"ASHA={new_lat1}ms, BT={new_lat2}ms"
+    )
+    log_audio(
+        "NOTE: GTK UI inputs remain independent - auto-adjustment only affects audio system"
+    )
+
+    return True
+
+
+def reset_packet_loss_tracking():
+    """Reset packet loss tracking when conditions improve"""
+    global packet_loss_count, last_packet_loss_time, last_latency_adjust_loss  # ADDED: last_latency_adjust_loss
+    
+    current_time = time.time()
+    
+    # Reset count if no packet loss for a while
+    if current_time - last_packet_loss_time > 10:  # 10 seconds without packet loss
+        if packet_loss_count > 0:
+            log_debug(f"Resetting packet loss count (no packet loss for 10s)")
+            packet_loss_count = 0
+            last_latency_adjust_loss = 0  # Also reset the adjust tracking
+
 
 def reset_latencies_to_original():
 	"""Reset latencies to original values"""
@@ -2935,18 +3015,20 @@ exit
 		Reads the ASHA output and watches for connection drops or GATT triggers.
 		"""
 		child_pid, master_fd = asha_handle
-		
+
 		# Validate process is actually running
 		try:
 			os.kill(child_pid, 0)
 		except ProcessLookupError:
 			log_error("ASHA process not running at stream start")
 			return
-		
+
 		buffer = b""
 		last_stats: Optional[dict] = None
-		
+
 		buffer_x, buffer_y, buffer_z = [], [], []
+		packet_loss_history: list[float] = []
+		PACKET_LOSS_COOLDOWN = 2
 		
 		def safe_append(buf, val):
 			if not isinstance(buf, list):
@@ -2963,61 +3045,52 @@ exit
 				return True
 			return False
 
-		def detect_loss(x, y, z, max_history=50, min_samples=10, spike_threshold=5.0, flatline_epsilon=1e-6, drift_limit=0.10):
-			# Require persistent buffers
-			if not isinstance(x, (list, tuple)) or \
-			   not isinstance(y, (list, tuple)) or \
-			   not isinstance(z, (list, tuple)):
-				raise TypeError("x, y, z must be history buffers (list or tuple)")
+		def detect_loss(x, y, z, max_history=50, min_samples=50,
+						spike_threshold=20.0, drift_limit=6,
+						cooldown=PACKET_LOSS_COOLDOWN) -> bool:
+			"""
+			Detect packet loss based on history buffers x, y, z.
+			Reacts quickly to sudden spikes in any two streams.
+			Prevents flapping using a local cooldown mechanism.
+			"""
 
+			# Trim history buffers
 			clr_history(x, max_history)
 			clr_history(y, max_history)
 			clr_history(z, max_history)
+			clr_history(packet_loss_history, max_history)
 
+			# Not enough samples
 			if len(x) < min_samples or len(y) < min_samples or len(z) < min_samples:
 				return False
 
-			# ---------- helpers ----------
+			# Compute rates
 			def rate(buf):
-				return abs(buf[-1] - buf[-2])
+				return abs(buf[-1] - buf[-2]) if len(buf) >= 2 else 0.0
 
-			def flatline(buf):
-				for i in range(1, len(buf)):
-					if abs(buf[i] - buf[0]) > flatline_epsilon:
-						return False
-				return True
+			rates = [rate(x), rate(y), rate(z)]
 
-			# ---------- rate of change ----------
-			dx = rate(x)
-			dy = rate(y)
-			dz = rate(z)
-			avg_rate = (dx + dy + dz) / 3.0
-
-			# ---------- 1. detect frozen stream ----------
-			# packet loss often causes repeated identical samples
-			if flatline(x) and flatline(y) and flatline(z):
-				return True
-
-			# ---------- 2. ignore true silence ----------
-			if avg_rate < drift_limit:
+			# Ignore very slow drift
+			if all(r < drift_limit for r in rates):
 				return False
 
-			# ---------- 3. sudden jump detection ----------
-			spikes = 0
-			if dx > spike_threshold:
-				spikes += 1
-			if dy > spike_threshold:
-				spikes += 1
-			if dz > spike_threshold:
-				spikes += 1
-
-			# majority vote instead of all-or-nothing
+			# Sudden spike detection
+			spikes = sum(1 for r in rates if r > spike_threshold)
 			if spikes >= 2:
+				now = time.time()
+				# Remove old events beyond cooldown
+				packet_loss_history[:] = [t for t in packet_loss_history if now - t < cooldown]
+
+				if packet_loss_history:
+					# Cooldown active, skip triggering
+					return False
+
+				# Record this packet-loss event
+				packet_loss_history.append(now)
 				return True
 
 			return False
 
-		
 		# Updated regex to optionally capture Rssi: <val>, <val>
 		ring_regex = re.compile(
 			r"Ring Occupancy:\s*(\d+)\s+High:\s*(\d+)\s+Ring Dropped:\s*(\d+)\s+Total:\s*(\d+)\s+"
@@ -3135,10 +3208,9 @@ exit
 										packet_loss_count += 1
 										last_packet_loss_time = time.time()
 										
-										log_warning(f"ASHA packet loss detected (count: {packet_loss_count})")
-										
 										# Try adjusting latency first if configured
 										if PACKETLOSS_ADJUST_ENABLED:
+											log_warning(f"ASHA packet loss detected (count: {packet_loss_count})")
 											if adjust_latency_for_packet_loss():
 												# Latency was adjusted, don't trigger reconnect immediately
 												# Continue monitoring to see if adjustment helps
