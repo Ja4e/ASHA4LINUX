@@ -2007,79 +2007,79 @@ last_latency_adjust_loss = 0
 # PACKET LOSS ADJUSTMENT FUNCTIONS
 # ------------------------------
 def adjust_latency_for_packet_loss():
-    """
-    Adjust audio latency in response to packet loss.
-    ONLY reacts to packet-loss DELTAS since last adjustment.
-    Stops adjusting once max latency is reached.
-    """
-    global packet_loss_count, latency_adjusted, original_lat1, original_lat2
-    global AUDIO_LAT1, AUDIO_LAT2, last_latency_adjust_loss
+	"""
+	Adjust audio latency in response to packet loss.
+	ONLY reacts to packet-loss DELTAS since last adjustment.
+	Stops adjusting once max latency is reached.
+	"""
+	global packet_loss_count, latency_adjusted, original_lat1, original_lat2
+	global AUDIO_LAT1, AUDIO_LAT2, last_latency_adjust_loss
 
-    if not PACKETLOSS_ADJUST_ENABLED:
-        return False
+	if not PACKETLOSS_ADJUST_ENABLED:
+		return False
 
-    threshold = PACKETLOSS_ADJUST_CONFIG.get("Threshold", 3)
+	threshold = PACKETLOSS_ADJUST_CONFIG.get("Threshold", 3)
 
-    # -------- DELTA-BASED GATE --------
-    delta_since_adjust = packet_loss_count - last_latency_adjust_loss
-    if delta_since_adjust < threshold:
-        return False
+	# -------- DELTA-BASED GATE --------
+	delta_since_adjust = packet_loss_count - last_latency_adjust_loss
+	if delta_since_adjust < threshold:
+		return False
 
-    # GET ACTUAL CURRENT LATENCIES
-    if audio_combiner_manager and audio_combiner_started.is_set():
-        current_lat1, current_lat2 = audio_combiner_manager.get_latencies()
-    else:
-        current_lat1, current_lat2 = AUDIO_LAT1, AUDIO_LAT2
+	# GET ACTUAL CURRENT LATENCIES
+	if audio_combiner_manager and audio_combiner_started.is_set():
+		current_lat1, current_lat2 = audio_combiner_manager.get_latencies()
+	else:
+		current_lat1, current_lat2 = AUDIO_LAT1, AUDIO_LAT2
 
-    affect_sink = PACKETLOSS_ADJUST_CONFIG.get("Affect_Sink", "asha")
-    adjust_step = PACKETLOSS_ADJUST_CONFIG.get("Adjust_Step", 5)
-    max_latency = PACKETLOSS_ADJUST_CONFIG.get("Max_Latency", 200)
+	affect_sink = PACKETLOSS_ADJUST_CONFIG.get("Affect_Sink", "asha")
+	adjust_step = PACKETLOSS_ADJUST_CONFIG.get("Adjust_Step", 5)
+	max_latency = PACKETLOSS_ADJUST_CONFIG.get("Max_Latency", 200)
 
-    new_lat1, new_lat2 = current_lat1, current_lat2
+	new_lat1, new_lat2 = current_lat1, current_lat2
 
-    if affect_sink in ["asha", "both"] and current_lat1 < max_latency:
-        new_lat1 = min(current_lat1 + adjust_step, max_latency)
+	if affect_sink in ["asha", "both"] and current_lat1 < max_latency:
+		new_lat1 = min(current_lat1 + adjust_step, max_latency)
 
-    if affect_sink in ["bt", "both"] and current_lat2 < max_latency:
-        new_lat2 = min(current_lat2 + adjust_step, max_latency)
+	if affect_sink in ["bt", "both"] and current_lat2 < max_latency:
+		new_lat2 = min(current_lat2 + adjust_step, max_latency)
 
-    # If both sinks have already hit max, skip adjustment
-    if new_lat1 == current_lat1 and new_lat2 == current_lat2:
-        last_latency_adjust_loss = packet_loss_count
-        log_audio(f"Max latency reached (ASHA={current_lat1}ms, BT={current_lat2}ms), no adjustment applied")
-        return False
+	# If both sinks have already hit max, skip adjustment
+	if new_lat1 == current_lat1 and new_lat2 == current_lat2:
+		last_latency_adjust_loss = packet_loss_count
+		log_audio(f"Max latency reached (ASHA={current_lat1}ms, BT={current_lat2}ms), no adjustment applied")
+		return False
 
-    AUDIO_LAT1, AUDIO_LAT2 = new_lat1, new_lat2
+	AUDIO_LAT1, AUDIO_LAT2 = new_lat1, new_lat2
 
-    if audio_combiner_manager and audio_combiner_started.is_set():
-        audio_combiner_manager.set_latencies(new_lat1, new_lat2, force_update=True)
+	if audio_combiner_manager and audio_combiner_started.is_set():
+		audio_combiner_manager.set_latencies(new_lat1, new_lat2, force_update=True)
 
-    last_latency_adjust_loss = packet_loss_count
-    latency_adjusted = True
+	last_latency_adjust_loss = packet_loss_count
+	latency_adjusted = True
 
-    log_audio(
-        f"Packet loss auto-adjusted latencies: "
-        f"ASHA={new_lat1}ms, BT={new_lat2}ms"
-    )
-    log_audio(
-        "NOTE: GTK UI inputs remain independent - auto-adjustment only affects audio system"
-    )
+	log_audio(
+		f"Packet loss auto-adjusted latencies: "
+		f"ASHA={new_lat1}ms, BT={new_lat2}ms"
+	)
+	log_audio(
+		"NOTE: GTK UI inputs remain independent - auto-adjustment only affects audio system"
+	)
 
-    return True
+	return True
 
 
 def reset_packet_loss_tracking():
-    """Reset packet loss tracking when conditions improve"""
-    global packet_loss_count, last_packet_loss_time, last_latency_adjust_loss  # ADDED: last_latency_adjust_loss
-    
-    current_time = time.time()
-    
-    # Reset count if no packet loss for a while
-    if current_time - last_packet_loss_time > 10:  # 10 seconds without packet loss
-        if packet_loss_count > 0:
-            log_debug(f"Resetting packet loss count (no packet loss for 10s)")
-            packet_loss_count = 0
-            last_latency_adjust_loss = 0  # Also reset the adjust tracking
+	"""Reset packet loss tracking when conditions improve"""
+	global packet_loss_count, last_packet_loss_time, last_latency_adjust_loss  # ADDED: last_latency_adjust_loss
+	
+	current_time = time.time()
+	
+	# Reset count if no packet loss for a while
+	if current_time - last_packet_loss_time > 10:  # 10 seconds without packet loss
+		if packet_loss_count > 0:
+			log_debug(f"Resetting packet loss count (no packet loss for 10s)")
+			packet_loss_count = 0
+			last_latency_adjust_loss = 0  # Also reset the adjust tracking
 
 
 def reset_latencies_to_original():
