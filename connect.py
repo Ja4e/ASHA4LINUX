@@ -4064,7 +4064,7 @@ def main() -> None:
 	# Check and acquire lock before proceeding
 	if not lock_manager.acquire_lock():
 		log_error("Failed to acquire lock. Another instance may be running or lock file is corrupted.")
-		sys.exit(1)
+		# sys.exit(1)
 	
 	parser = create_parser()
 	parser.add_argument('-h', '--help', action='help', help='Show this help message and exit')
