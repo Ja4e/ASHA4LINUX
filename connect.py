@@ -116,6 +116,7 @@ import json
 import psutil
 import queue
 import gc
+import atexit
 
 colorama_init(autoreset=True)
 
@@ -125,7 +126,7 @@ colorama_init(autoreset=True)
 global_lock = threading.RLock()
 
 # ------------------------------
-# LOCK FILE MANAGEMENT
+# LOCK FILE MANAGEMENT - IMPROVED FOR RESTART SCENARIOS
 # ------------------------------
 LOCK_FILE_PATH = os.path.expanduser("~/.config/asha_manager/process.lock")
 
@@ -134,16 +135,70 @@ class ProcessLockManager:
 	
 	def __init__(self, lock_file_path: str = LOCK_FILE_PATH):
 		self.lock_file_path = lock_file_path
+		self.temp_file_path = lock_file_path + ".tmp"
 		self.lock_data = {
 			"pid": os.getpid(),
 			"loopback_ids": [],
 			"module_ids": [],
-			"start_time": time.time()
+			"start_time": time.time(),
+			"version": "1.0",
+			"script_path": sys.argv[0] if sys.argv else None
 		}
 		self.lock_held = False
 		
+		# Clean up any leftover temp file on init
+		self._cleanup_temp_file()
+		
+		# Register atexit handler
+		atexit.register(self._atexit_cleanup)
+		
+	def _cleanup_temp_file(self):
+		"""Clean up any leftover temp file"""
+		try:
+			if os.path.exists(self.temp_file_path):
+				os.remove(self.temp_file_path)
+		except:
+			pass
+	
+	def _atexit_cleanup(self):
+		"""Cleanup handler called at program exit"""
+		if self.lock_held:
+			log_warning("Lock still held at exit, attempting cleanup...")
+			self.release_lock()
+	
+	def __del__(self):
+		"""Safety cleanup on garbage collection"""
+		try:
+			if self.lock_held and os.path.exists(self.lock_file_path):
+				log_warning("Lock still held during garbage collection!")
+				self.release_lock()
+		except:
+			pass
+	
+	def _is_our_script(self, pid: int) -> bool:
+		"""Check if a process is running our script"""
+		try:
+			# Try to read the process command line
+			with open(f"/proc/{pid}/cmdline", 'rb') as f:
+				cmdline = f.read().decode('utf-8', errors='ignore').replace('\x00', ' ')
+			
+			# Get our script name
+			our_script = os.path.basename(sys.argv[0]) if sys.argv else ""
+			
+			# Check for our script name or ASHA keywords
+			if our_script and our_script in cmdline:
+				return True
+			
+			# Check for common ASHA script patterns
+			if any(keyword in cmdline.lower() for keyword in ['asha', 'bluetooth', 'hearing', 'pipewire']):
+				return True
+				
+			return False
+		except (IOError, FileNotFoundError, ProcessLookupError):
+			return False
+	
 	def check_and_cleanup_old_lock(self) -> bool:
-		"""Check if lock file exists and clean up if old process is dead"""
+		"""Check if lock file exists and clean up if old process is dead OR if it's a restart scenario"""
 		if not os.path.exists(self.lock_file_path):
 			return True
 			
@@ -152,20 +207,68 @@ class ProcessLockManager:
 				old_lock_data = json.load(f)
 			
 			old_pid = old_lock_data.get("pid")
+			current_pid = os.getpid()
+			current_script = sys.argv[0] if sys.argv else None
+			old_script = old_lock_data.get("script_path")
+			
+			# If the lock file belongs to the current process (same PID), it's a restart scenario
+			if old_pid == current_pid:
+				# This is a restart (os.execv scenario) - same PID, different process instance
+				log_info(f"Detected restart scenario (same PID: {current_pid}), taking over lock file")
+				
+				# Check if it's really our script
+				if old_script and current_script and old_script in current_script:
+					# Definitely a restart - keep existing module IDs and update PID/timestamp
+					log_info("Same script detected, updating lock file for restart")
+					
+					# Preserve existing module IDs but update timestamp
+					self.lock_data["loopback_ids"] = old_lock_data.get("loopback_ids", [])
+					self.lock_data["module_ids"] = old_lock_data.get("module_ids", [])
+					self.lock_data["start_time"] = time.time()
+					self.lock_data["restarted"] = True
+					
+					# Write updated lock file
+					self._write_lock_file()
+					self.lock_held = True
+					log_info(f"Lock file updated for restart (PID: {current_pid})")
+					return True
 			
 			# Check if old process is still running
 			if old_pid and self._is_process_running(old_pid):
-				log_error(f"Another instance is running (PID: {old_pid}). Exiting.")
-				return False
-			else:
-				# Old process is dead, clean up its resources
-				log_warning(f"Cleaning up leftover resources from dead process (PID: {old_pid})")
-				self._cleanup_leftover_resources(old_lock_data)
-				
-				# Remove old lock file
+				# Process is running, check if it's our script
+				if self._is_our_script(old_pid):
+					# It's our script but different PID - check if we're in a restart chain
+					if old_script and current_script and old_script in current_script:
+						# This might be a parent/child restart scenario
+						log_warning(f"Our script is running (PID: {old_pid}), but different PID. Assuming restart chain.")
+						# Try to clean up the old process gently
+						try:
+							os.kill(old_pid, signal.SIGTERM)
+							time.sleep(0.5)
+						except:
+							pass
+					else:
+						# Different script/instance
+						log_error(f"Another instance of our script is running (PID: {old_pid}). Exiting.")
+						return False
+				else:
+					# Different process, not our script
+					log_error(f"Another process is running (PID: {old_pid}). Exiting.")
+					return False
+			
+			# Old process is dead or we killed it, clean up its resources
+			log_warning(f"Cleaning up leftover resources from old process (PID: {old_pid})")
+			self._cleanup_leftover_resources(old_lock_data)
+			
+			# Remove old lock file
+			try:
 				os.remove(self.lock_file_path)
 				log_info("Old lock file removed and resources cleaned up")
-				return True
+			except Exception as e:
+				log_error(f"Failed to remove old lock file: {e}")
+				# Try to at least clean up the resources
+				self._force_cleanup_audio_modules()
+			return True
 				
 		except (json.JSONDecodeError, IOError) as e:
 			log_warning(f"Could not read lock file: {e}, attempting cleanup")
@@ -221,6 +324,11 @@ class ProcessLockManager:
 		"""Force cleanup of all audio modules that might be leftover"""
 		log_warning("Performing force cleanup of audio modules")
 		
+		# Clear lock data first
+		with global_lock:
+			self.lock_data["loopback_ids"] = []
+			self.lock_data["module_ids"] = []
+		
 		# Get all modules
 		modules = run_cmd(['pactl', 'list', 'short', 'modules'], capture=True)
 		if not modules:
@@ -238,6 +346,12 @@ class ProcessLockManager:
 			log_info(f"Force cleaning module: {module_id}")
 			run_cmd(['pactl', 'unload-module', module_id], check=False)
 			time.sleep(0.05)
+		
+		# Update lock file after cleanup
+		try:
+			self._write_lock_file()
+		except:
+			pass
 	
 	def acquire_lock(self) -> bool:
 		"""Acquire lock by creating lock file"""
@@ -252,9 +366,8 @@ class ProcessLockManager:
 			os.makedirs(os.path.dirname(self.lock_file_path), exist_ok=True)
 			
 			# Write lock file
-			with open(self.lock_file_path, 'w') as f:
-				json.dump(self.lock_data, f, indent=2)
-			
+			self._write_lock_file()
+		
 			self.lock_held = True
 			log_info(f"Lock acquired (PID: {self.lock_data['pid']})")
 			return True
@@ -275,8 +388,7 @@ class ProcessLockManager:
 				if module_ids is not None:
 					self.lock_data["module_ids"] = module_ids
 				
-				with open(self.lock_file_path, 'w') as f:
-					json.dump(self.lock_data, f, indent=2)
+				self._write_lock_file()
 					
 		except Exception as e:
 			log_error(f"Failed to update lock file: {e}")
@@ -322,34 +434,78 @@ class ProcessLockManager:
 				self._write_lock_file()
 	
 	def _write_lock_file(self) -> None:
-		"""Write lock file atomically"""
-		try:
-			# Write to temp file first
-			temp_file = self.lock_file_path + ".tmp"
-			with open(temp_file, 'w') as f:
-				json.dump(self.lock_data, f, indent=2)
-			
-			# Rename to actual lock file
-			os.replace(temp_file, self.lock_file_path)
-			
-		except Exception as e:
-			log_error(f"Failed to write lock file: {e}")
+		"""Write lock file atomically with retry logic"""
+		max_attempts = 3
+		for attempt in range(max_attempts):
+			try:
+				# Write to temp file first
+				with open(self.temp_file_path, 'w') as f:
+					json.dump(self.lock_data, f, indent=2)
+					f.flush()
+					os.fsync(f.fileno())
+				
+				# Rename to actual lock file (atomic on Unix)
+				os.replace(self.temp_file_path, self.lock_file_path)
+				return
+				
+			except Exception as e:
+				if attempt == max_attempts - 1:
+					raise Exception(f"Failed to write lock file after {max_attempts} attempts: {e}")
+				log_warning(f"Lock file write attempt {attempt + 1} failed: {e}")
+				time.sleep(0.1)
 	
 	def release_lock(self) -> None:
-		"""Release lock by removing lock file"""
+		"""Release lock by removing lock file with multiple attempts"""
 		if not self.lock_held:
 			return
 			
-		try:
-			if os.path.exists(self.lock_file_path):
-				os.remove(self.lock_file_path)
-			self.lock_held = False
-			log_info("Lock released")
-		except Exception as e:
-			log_error(f"Failed to release lock: {e}")
+		max_attempts = 3
+		for attempt in range(max_attempts):
+			try:
+				with global_lock:
+					# Clear lock data first
+					self.lock_data["loopback_ids"] = []
+					self.lock_data["module_ids"] = []
+					
+					# Write empty lock file first (ensures consistency)
+					self._write_lock_file()
+					time.sleep(0.1)
+					
+					# Now remove the file
+					if os.path.exists(self.lock_file_path):
+						os.remove(self.lock_file_path)
+					
+					# Also remove temp file if it exists
+					if os.path.exists(self.temp_file_path):
+						try:
+							os.remove(self.temp_file_path)
+						except:
+							pass
+					
+					self.lock_held = False
+					log_info("Lock released successfully")
+					break
+					
+			except Exception as e:
+				if attempt == max_attempts - 1:
+					log_error(f"Failed to release lock after {max_attempts} attempts: {e}")
+					# Try one last desperate attempt
+					try:
+						if os.path.exists(self.lock_file_path):
+							import subprocess
+							subprocess.run(['rm', '-f', self.lock_file_path], 
+										 stderr=subprocess.DEVNULL)
+					except:
+						pass
+				else:
+					log_warning(f"Lock release attempt {attempt + 1} failed: {e}")
+					time.sleep(0.5)
 
 # Global lock manager
 lock_manager = ProcessLockManager()
+
+# Global cleanup flag
+cleanup_in_progress = False
 
 # ------------------------------
 # Logging Setup
@@ -431,76 +587,39 @@ def log_gtk(message: str) -> None:
 	logger.info(f"{Fore.CYAN}[GTK] {message}{Style.RESET_ALL}")
 
 # ------------------------------
-# COMPREHENSIVE CLEANUP FUNCTION
+# COMPREHENSIVE CLEANUP FUNCTION - IMPROVED
 # ------------------------------
 def cleanup_before_exit():
 	"""Comprehensive cleanup before script exit"""
+	global cleanup_in_progress
+	if cleanup_in_progress:
+		return
+	cleanup_in_progress = True
+	
 	log_info("=== COMPREHENSIVE CLEANUP BEFORE EXIT ===", Fore.RED)
 	
 	# Set shutdown event to signal all threads
 	shutdown_evt.set()
 	
-	try:
-		# 1. Stop GTK UI first (if running)
-		log_info("Stopping GTK UI...", Fore.YELLOW)
-		stop_gtk_ui()
-		
-		# Wait a bit for GTK UI to close
-		time.sleep(0.5)
-	except Exception as e:
-		log_error(f"Error stopping GTK UI: {e}")
+	cleanup_order = [
+		("GTK UI", stop_gtk_ui),
+		("Async event loop", lambda: async_manager.cleanup()),
+		("Audio combiner", lambda: audio_combiner_manager.force_stop() if audio_combiner_manager else None),
+		("Secondary reconnection", secondary_reconnection_manager.stop_all_reconnections),
+		("Connection delay", connection_delay_manager.reset_delay),
+		("ASHA processes", kill_existing_asha_processes),
+		("Process lock", lock_manager.release_lock),
+	]
 	
-	try:
-		# 2. Stop audio combiner with force flag
-		log_info("Stopping audio combiner...", Fore.YELLOW)
-		if audio_combiner_manager and audio_combiner_started.is_set():
-			# Use a stronger stop method that forces cleanup
-			audio_combiner_manager.force_stop()
-		audio_combiner_stop.set()
-		audio_combiner_started.clear()
-		
-		# Wait for audio combiner threads
-		if audio_combiner_thread and audio_combiner_thread.is_alive():
-			audio_combiner_thread.join(timeout=1.0)
-	except Exception as e:
-		log_error(f"Error stopping audio combiner: {e}")
+	for name, cleanup_func in cleanup_order:
+		try:
+			log_info(f"Cleaning up {name}...", Fore.YELLOW)
+			cleanup_func()
+			time.sleep(0.1)  # Small delay between cleanup steps
+		except Exception as e:
+			log_error(f"Error cleaning up {name}: {e}")
 	
-	try:
-		# 3. Stop secondary reconnection manager
-		log_info("Stopping secondary reconnection manager...", Fore.YELLOW)
-		secondary_reconnection_manager.stop_all_reconnections()
-	except Exception as e:
-		log_error(f"Error stopping reconnection manager: {e}")
-	
-	try:
-		# 4. Cancel connection delay timer
-		log_info("Cancelling connection delay timer...", Fore.YELLOW)
-		connection_delay_manager.reset_delay()
-	except Exception as e:
-		log_error(f"Error cancelling delay timer: {e}")
-	
-	try:
-		# 5. Stop async event loop
-		log_info("Stopping async event loop...", Fore.YELLOW)
-		async_manager.stop()
-	except Exception as e:
-		log_error(f"Error stopping async event loop: {e}")
-	
-	try:
-		# 6. Kill any remaining ASHA processes
-		log_info("Killing any remaining ASHA processes...", Fore.YELLOW)
-		kill_existing_asha_processes()
-	except Exception as e:
-		log_error(f"Error killing ASHA processes: {e}")
-	
-	try:
-		# 7. Release the process lock
-		log_info("Releasing process lock...", Fore.YELLOW)
-		lock_manager.release_lock()
-	except Exception as e:
-		log_error(f"Error releasing lock: {e}")
-	
-	# 8. Force garbage collection
+	# Force garbage collection
 	gc.collect()
 	
 	log_info("Cleanup complete. Exiting...", Fore.GREEN)
@@ -715,7 +834,7 @@ CONNECTION_DELAY_ENABLED: bool = config["Connection_Delay"].get("Enabled", False
 CONNECTION_DELAY_SECONDS: float = config["Connection_Delay"].get("Delay_Seconds", 5.0)
 DELAY_ONLY_AFTER_BOTH: bool = config["Connection_Delay"].get("Only_After_Both", True)
 DELAY_APPLY_TO: str = config["Connection_Delay"].get("Apply_To", "all")
-DELAY_RESET_AFTER_DISCONNECT: bool = config["Connection_Delay"].get("Reset_After_Disconnect", True)
+DELAY_RESET_AFTER_DISCONNECT: bool = config["Connection_Delay"].get("Reset_After_DISCONNECT", True)
 
 # Extract audio combiner settings
 AUDIO_COMBINER_ENABLED: bool = config["AudioCombiner"].get("Enabled", False)
@@ -1096,7 +1215,7 @@ latency_adjusted = False
 latency_reset_timer: Optional[threading.Timer] = None
 
 # ------------------------------
-# ASYNC EVENT LOOP MANAGEMENT
+# ASYNC EVENT LOOP MANAGEMENT - IMPROVED
 # ------------------------------
 class AsyncEventLoopManager:
 	"""Thread-safe async event loop management"""
@@ -1137,6 +1256,21 @@ class AsyncEventLoopManager:
 			self._started = False
 			log_info("Async event loop stopped")
 			
+	def cleanup(self):
+		"""Cleanup async resources"""
+		with global_lock:
+			if self._started and self.loop:
+				try:
+					self.loop.call_soon_threadsafe(self.loop.stop)
+					if self.thread:
+						self.thread.join(timeout=5.0)
+				except:
+					pass
+				self._started = False
+				self.loop = None
+				self.thread = None
+				log_info("Async event loop cleaned up")
+			
 	def run_coroutine_threadsafe(self, coro):
 		"""Run a coroutine in a thread-safe manner"""
 		if not self._started or not self.loop:
@@ -1147,7 +1281,7 @@ class AsyncEventLoopManager:
 async_manager = AsyncEventLoopManager()
 
 # ------------------------------
-# AUDIO COMBINER CLASSES
+# AUDIO COMBINER CLASSES - IMPROVED
 # ------------------------------
 class Sink:
 	__slots__ = ('name','target','desc','channel','latency','loopback_id','module_id','orig_volume')
@@ -1373,6 +1507,20 @@ class AudioCombinerManager:
 			current_loopbacks = set(lock_manager.lock_data.get("loopback_ids", []))
 			current_modules = set(lock_manager.lock_data.get("module_ids", []))
 		
+		# Also check our own local IDs
+		my_ids = set()
+		if self.sink1.loopback_id:
+			my_ids.add(self.sink1.loopback_id)
+		if self.sink2.loopback_id:
+			my_ids.add(self.sink2.loopback_id)
+		if self.sink1.module_id:
+			my_ids.add(self.sink1.module_id)
+		if self.sink2.module_id:
+			my_ids.add(self.sink2.module_id)
+		if self.comb_sink.module_id:
+			my_ids.add(self.comb_sink.module_id)
+		
+		zombies_found = False
 		for line in modules.splitlines():
 			if 'module-loopback' in line or 'module-null-sink' in line or 'module-combine-sink' in line:
 				parts = line.split()
@@ -1380,14 +1528,19 @@ class AudioCombinerManager:
 					continue
 				module_id = parts[0]
 				
-				# Skip our own modules
-				if module_id in current_loopbacks or module_id in current_modules:
+				# Skip our own modules and those in lock file
+				if module_id in my_ids or module_id in current_loopbacks or module_id in current_modules:
 					continue
 				
-				# Check if this is a zombie module (no longer in our lock file)
-				log_warning(f"Unloading zombie audio module {module_id}")
+				# This is a zombie
+				zombies_found = True
+				log_warning(f"Unloading zombie audio module {module_id}: {line}")
 				run_cmd(['pactl', 'unload-module', module_id], check=False)
 				time.sleep(0.02)
+		
+		if zombies_found:
+			# Update lock file to reflect cleanup
+			lock_manager._write_lock_file()
 	
 	def monitor_loop(self) -> None:
 		"""Monitor audio sinks and adjust as needed"""
@@ -2411,7 +2564,7 @@ last_latency_adjust_loss = 0
 def adjust_latency_for_packet_loss():
 	"""
 	Adjust audio latency in response to packet loss.
-	ONLY reacts to packet-loss DELTAS since last adjustment.
+	ONLY reacts to packet-loss DELTAs since last adjustment.
 	Stops adjusting once max latency is reached.
 	"""
 	global packet_loss_count, latency_adjusted, original_lat1, original_lat2
@@ -3847,6 +4000,31 @@ exit
 					log_warning("Cleaning up orphaned ASHA processes")
 					kill_existing_asha_processes()
 
+	def perform_restart(self):
+		"""Perform a clean restart with proper lock file handling"""
+		log_info("Performing clean restart...")
+		
+		try:
+			# Update lock file before restart to indicate restart is happening
+			with global_lock:
+				lock_manager.lock_data["restarting"] = True
+				lock_manager.lock_data["restart_time"] = time.time()
+				lock_manager._write_lock_file()
+			
+			# Small delay to ensure file is written
+			time.sleep(0.1)
+			
+			# Perform cleanup and restart
+			self.cleanup()
+			
+			# Use os.execv to replace current process
+			os.execv(sys.executable, [sys.executable] + sys.argv)
+			
+		except Exception as e:
+			log_error(f"Restart failed: {e}")
+			# Try one more time with simpler restart
+			os.execv(sys.executable, [sys.executable] + sys.argv)
+
 	def _partial_restart(self):
 		"""Perform a partial restart (keeping GTK UI and audio combiner alive)"""
 		self._in_partial_restart = True
@@ -4020,8 +4198,7 @@ exit
 				if reset_evt.is_set():
 					log_info("Controller resetting...")
 					reset_evt.clear()
-					self.cleanup()
-					os.execv(sys.executable, [sys.executable] + sys.argv)
+					self.perform_restart()
 
 				if reconnect_evt.is_set():
 					if self.device_manager.keep_gtk_on_reconnect and KEEP_GTK_ON_RECONNECT_GLOBAL:
@@ -4031,8 +4208,7 @@ exit
 					else:
 						log_info("Reconnect triggered, restarting...")
 						reconnect_evt.clear()
-						self.cleanup()
-						os.execv(sys.executable, [sys.executable] + sys.argv)
+						self.perform_restart()
 
 				time.sleep(0.5)
 
@@ -4042,12 +4218,24 @@ exit
 			self.cleanup()
 
 # ------------------------------
-# SIGNAL HANDLER
+# SIGNAL HANDLER - IMPROVED
 # ------------------------------
 def signal_handler(signum, frame):
-	"""Handle termination signals"""
+	"""Handle termination signals with proper cleanup sequencing"""
+	global cleanup_in_progress
+	if cleanup_in_progress:
+		return  # Already cleaning up, ignore additional signals
+		
+	cleanup_in_progress = True
 	log_warning(f"Received signal {signum}, cleaning up...")
-	cleanup_before_exit()
+	
+	# Use a timeout to prevent hanging
+	import threading
+	cleanup_thread = threading.Thread(target=cleanup_before_exit)
+	cleanup_thread.daemon = True
+	cleanup_thread.start()
+	cleanup_thread.join(timeout=10.0)  # Wait max 10 seconds
+	
 	sys.exit(0)
 
 # Register signal handlers
@@ -4064,7 +4252,7 @@ def main() -> None:
 	# Check and acquire lock before proceeding
 	if not lock_manager.acquire_lock():
 		log_error("Failed to acquire lock. Another instance may be running or lock file is corrupted.")
-		# sys.exit(1)
+		sys.exit(1)
 	
 	parser = create_parser()
 	parser.add_argument('-h', '--help', action='help', help='Show this help message and exit')
