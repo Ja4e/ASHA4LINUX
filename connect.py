@@ -86,7 +86,6 @@ Usually, if connection return try to restart this device and try to rerun the sc
 """
 This script aims to assist all annonying G.722 bluetooth connection issues 
 """
-
 # ==============
 #  DEPENDENCIES
 # ==============
@@ -2394,7 +2393,7 @@ class SecondaryReconnectionManager:
 	
 	def start_reconnection_attempt(self, mac: str, name: str, device_manager, enabled: bool) -> None:
 		"""Start a reconnection attempt for a secondary device"""
-		if not self.should_attempt_reconnection(mac, name, enabled):
+		if not enabled:
 			return
 			
 		# Stop any existing reconnection thread for this device
@@ -2418,56 +2417,101 @@ class SecondaryReconnectionManager:
 	
 	def _reconnection_worker(self, mac: str, name: str, device_manager, stop_event: threading.Event, enabled: bool) -> None:
 		"""Worker thread for reconnecting to a secondary device"""
-		attempt_info = secondary_reconnection_attempts.get(mac, {})
-		attempt_count = attempt_info.get('attempts', 0) + 1
-		next_delay = attempt_info.get('next_delay', SECONDARY_INITIAL_DELAY)
+		attempt_count = 0
 		
-		log_reconnection(f"Reconnection attempt {attempt_count}/{SECONDARY_MAX_ATTEMPTS} for {name} in {next_delay:.1f}s")
+		while not stop_event.is_set() and not shutdown_evt.is_set() and enabled:
+			# Get current attempt info
+			with global_lock:
+				if mac not in secondary_reconnection_attempts:
+					# First attempt setup
+					secondary_reconnection_attempts[mac] = {
+						'attempts': 0,
+						'next_delay': SECONDARY_INITIAL_DELAY,
+						'last_attempt': 0
+					}
+				
+				attempt_info = secondary_reconnection_attempts[mac]
+				attempt_count = attempt_info['attempts'] + 1
+				
+				# Check if we've reached max attempts
+				if attempt_count > SECONDARY_MAX_ATTEMPTS:
+					log_reconnection(f"Max reconnection attempts ({SECONDARY_MAX_ATTEMPTS}) reached for {name}, giving up")
+					break
+				
+				# Calculate wait time
+				wait_time = attempt_info['next_delay']
+				log_reconnection(f"Reconnection attempt {attempt_count}/{SECONDARY_MAX_ATTEMPTS} for {name} in {wait_time:.1f}s")
+			
+			# Wait for the calculated delay
+			if stop_event.wait(wait_time):
+				log_reconnection(f"Reconnection attempt for {name} cancelled")
+				return
+				
+			if shutdown_evt.is_set():
+				return
+				
+			# Attempt reconnection
+			log_reconnection(f"Attempting to reconnect to {name} (attempt {attempt_count})")
+			
+			try:
+				# Use the same connection logic as initial connection
+				future = async_manager.run_coroutine_threadsafe(
+					self._async_reconnect_attempt(mac, name, device_manager)
+				)
+				success = future.result(timeout=MAX_TIMEOUT + 10)
+			except Exception as e:
+				log_error(f"Async reconnection failed for {name}: {e}")
+				success = False
+			
+			# Update reconnection attempt counter
+			with global_lock:
+				if mac in secondary_reconnection_attempts:
+					if success:
+						# Success - clear tracking
+						del secondary_reconnection_attempts[mac]
+						
+						log_reconnection(f"Successfully reconnected to {name}")
+						device_manager.add_connected_device(mac, name)
+						
+						# Reset latencies on secondary reconnection if packet loss adjustment was enabled
+						if PACKETLOSS_ADJUST_ENABLED and PACKETLOSS_ADJUST_CONFIG.get("Reset_After_Reconnect", True):
+							log_audio(f"Secondary device {name} reconnected, resetting latencies to original")
+							reset_latencies_to_original()
+						
+						# Execute GATT operations for the reconnected device
+						log_gatt(f"Executing GATT operations for reconnected secondary device {name}")
+						time.sleep(1)
+						self._execute_secondary_gatt_operations(mac, name)
+						
+						# Break out of loop on success
+						break
+					else:
+						# Failure - update for next attempt
+						attempt_info = secondary_reconnection_attempts[mac]
+						attempt_info['attempts'] = attempt_count
+						attempt_info['last_attempt'] = time.time()
+						
+						# Calculate next delay based on mode
+						if SECONDARY_RECONNECTION_MODE == "incremental":
+							next_delay = attempt_info['next_delay'] * SECONDARY_BACKOFF_MULTIPLIER
+							attempt_info['next_delay'] = min(next_delay, SECONDARY_MAX_DELAY)
+						elif SECONDARY_RECONNECTION_MODE == "constant":
+							attempt_info['next_delay'] = SECONDARY_INITIAL_DELAY
+						else:  # exponential
+							next_delay = SECONDARY_INITIAL_DELAY * (SECONDARY_BACKOFF_MULTIPLIER ** attempt_info['attempts'])
+							attempt_info['next_delay'] = min(next_delay, SECONDARY_MAX_DELAY)
+						
+						log_warning(f"Reconnection attempt {attempt_count} failed for {name}")
+						
+						# Continue loop for next attempt
+						continue
 		
-		# Wait for the calculated delay
-		if stop_event.wait(next_delay):
-			log_reconnection(f"Reconnection attempt for {name} cancelled")
-			return
-			
-		if shutdown_evt.is_set():
-			return
-			
-		# Attempt reconnection
-		log_reconnection(f"Attempting to reconnect to {name} (attempt {attempt_count})")
-		
-		try:
-			# Use the same connection logic as initial connection
-			future = async_manager.run_coroutine_threadsafe(
-				self._async_reconnect_attempt(mac, name, device_manager)
-			)
-			success = future.result(timeout=MAX_TIMEOUT + 10)
-		except Exception as e:
-			log_error(f"Async reconnection failed for {name}: {e}")
-			success = False
-		
-		# Update reconnection attempt counter
-		self.update_reconnection_attempt(mac, success)
-		
-		if success:
-			log_reconnection(f"Successfully reconnected to {name}")
-			device_manager.add_connected_device(mac, name)
-			
-			# Reset latencies on secondary reconnection if packet loss adjustment was enabled
-			if PACKETLOSS_ADJUST_ENABLED and PACKETLOSS_ADJUST_CONFIG.get("Reset_After_Reconnect", True):
-				log_audio(f"Secondary device {name} reconnected, resetting latencies to original")
-				reset_latencies_to_original()
-			
-			# Execute GATT operations for the reconnected device
-			log_gatt(f"Executing GATT operations for reconnected secondary device {name}")
-			time.sleep(1)
-			self._execute_secondary_gatt_operations(mac, name)
-		else:
-			log_warning(f"Reconnection attempt {attempt_count} failed for {name}")
-			
-			# Schedule next attempt if we haven't reached max attempts and feature is still enabled
-			if self.should_attempt_reconnection(mac, name, enabled):
-				log_reconnection(f"Scheduling next reconnection attempt for {name} in {secondary_reconnection_attempts[mac]['next_delay']:.1f}s")
-				self.start_reconnection_attempt(mac, name, device_manager, enabled)
+		# Clean up on exit
+		with global_lock:
+			if mac in self.reconnection_threads:
+				del self.reconnection_threads[mac]
+			if mac in self.reconnection_events:
+				del self.reconnection_events[mac]
 	
 	async def _async_reconnect_attempt(self, mac: str, name: str, device_manager) -> bool:
 		"""Asynchronous reconnection attempt for secondary device"""
