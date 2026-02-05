@@ -1767,7 +1767,7 @@ class GtkLatencyUI:
 				self.spin2.set_hexpand(True)
 				self.spin2.connect("value-changed", self.on_spin_changed)
 				
-				# Status label - FIXED: Show current GTK UI values
+				# Status label Show current GTK UI values
 				self.status_label = Gtk.Label(
 					label=f"Current GTK UI values: ASHA={ui.current_lat1}ms, BT={ui.current_lat2}ms"
 				)
@@ -1843,7 +1843,7 @@ class GtkLatencyUI:
 				self._pending_changes = False
 				
 				if self.status_label:
-					# FIXED: Show current GTK UI values, not "Applied"
+					# Show current GTK UI values, not "Applied"
 					self.status_label.set_label(
 						f"Current GTK UI values: ASHA={lat1}ms, BT={lat2}ms"
 					)
@@ -3417,7 +3417,7 @@ exit
 			master_fd, slave_fd = pty.openpty()
 			try:
 				proc = subprocess.Popen(
-					["stdbuf", "-oL", EXECUTABLE, "--buffer_algorithm", "threaded", "--phy2m"],
+					["stdbuf", "-oL", EXECUTABLE, "--buffer_algorithm", "threaded", "--phy2m", "--timeout", "200"],
 					preexec_fn=os.setsid,
 					stdin=slave_fd,
 					stdout=slave_fd,
