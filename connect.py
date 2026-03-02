@@ -3169,14 +3169,17 @@ class BluetoothAshaManager:
 				log_error(f"Connection attempt exception for {device_type}: {e}")
 				# Only trigger reset for primary device exceptions, not secondary
 				if device_type == "primary" and self.args.reset_on_failure and not shutdown_evt.is_set():
-					log_warning("All connection attempts failed — restarting via os.execv()")
-					reset_evt.set()
-					try:
-						self.cleanup()
-					except Exception as e:
-						log_error(f"Cleanup failed before restart: {e}")
-					os.execv(sys.executable, [sys.executable] + sys.argv)
-
+					if not asha_started or not is_asha_process_running():
+						log_warning("All connection attempts failed — restarting via os.execv()")
+						reset_evt.set()
+						try:
+							self.cleanup()
+						except Exception as e:
+							log_error(f"Cleanup failed before restart: {e}")
+						os.execv(sys.executable, [sys.executable] + sys.argv)
+					else:
+						log_warning(f"Failed to connect to primary {mac_address} but ASHA is already running - continuing without restart")
+						return False
 			attempts += 1
 			await asyncio.sleep(DEFAULT_RETRY_INTERVAL)
 
