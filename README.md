@@ -7,3 +7,5 @@ Supports other ASHA devices for volume control with provided bash script (volume
 
 TODO:
 improve the wiki
+
+upcoming huge updates... its kinda hard to replicate GNOME's settings
